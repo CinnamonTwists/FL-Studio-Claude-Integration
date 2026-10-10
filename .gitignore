@@ -1,0 +1,21 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+.ruff_cache/
+.pytest_cache/
+
+# audio: keep reference tracks, stems and big renders out of the repo
+*.wav
+*.flac
+*.webm
+*.m4a
+stems/
+FL References/
+reference/
+
+# tool output
+skills/fl-studio/scripts/*.jpg
+fl_mcp_*.png

@@ -1,0 +1,2052 @@
+diff --git a/fl_controller/FLStudioMCP/device_FLStudioMCP.py b/fl_controller/FLStudioMCP/device_FLStudioMCP.py
+index 632a4c6..4112232 100644
+--- a/fl_controller/FLStudioMCP/device_FLStudioMCP.py
++++ b/fl_controller/FLStudioMCP/device_FLStudioMCP.py
+@@ -877,6 +877,39 @@ def _h_plugin_preset(p):
+     return out
+ 
+ 
++# -- Generic API call (dev/explore) ------------------------------------------
++
++def _h_api_call(p):
++    """Call one FL scripting-module function: {module, fn, args?} -> {result}.
++    Only FL API modules are reachable (no builtins/eval). Results that aren't
++    JSON-safe are returned as repr strings. Use 'batch': [[fn, args], ...] to
++    make several calls on the same module in one round trip."""
++    mods = {"plugins": plugins, "channels": channels, "mixer": mixer, "patterns": patterns,
++            "playlist": playlist, "transport": transport, "ui": ui, "general": general,
++            "device": device, "arrangement": arrangement, "midi": midi}
++    mod = mods.get(p.get("module", ""))
++    if mod is None:
++        return {"ok": False, "error": "unknown module %r" % p.get("module")}
++
++    def one(fn, args):
++        f = getattr(mod, fn, None)
++        if f is None:
++            return {"fn": fn, "error": "no such function"}
++        try:
++            r = f(*args) if callable(f) else f
++            try:
++                json.dumps(r)
++            except (TypeError, ValueError):
++                r = repr(r)
++            return {"fn": fn, "result": r}
++        except Exception as e:
++            return {"fn": fn, "error": "%s: %s" % (type(e).__name__, e)}
++
++    if "batch" in p:
++        return {"ok": True, "results": [one(fn, args) for fn, args in p["batch"]]}
++    return dict(ok=True, **one(p["fn"], p.get("args", [])))
++
++
+ # -- API introspection / arrangement probe -----------------------------------
+ 
+ def _h_api_probe(p):
+@@ -1027,8 +1060,19 @@ def _h_channel_select(p):
+         channels.selectOneChannel(idx)
+     except Exception as e:
+         return {"ok": False, "error": "selectOneChannel: %s" % e}
++    # An already-open Piano roll stays on its old channel; it only picks up the
++    # selected channel when (re)opened. Close it so the next ensure_piano_roll
++    # reopens it on this channel.
++    reopened = False
++    wid = getattr(midi, "widPianoRoll", None)
++    try:
++        if wid is not None and ui.getVisible(wid) and hasattr(ui, "hideWindow"):
++            ui.hideWindow(wid)
++            reopened = True
++    except Exception:
++        pass
+     return {"ok": True, "channel": idx, "name": channels.getChannelName(idx),
+-            "selected": channels.channelNumber()}
++            "selected": channels.channelNumber(), "piano_roll_closed": reopened}
+ 
+ 
+ def _h_arrange_add_marker(p):
+@@ -1094,6 +1138,7 @@ _HANDLERS = {
+     "channel_get_color": _h_channel_get_color,
+     "plugin_preset": _h_plugin_preset,
+     "api_probe": _h_api_probe,
++    "api_call": _h_api_call,
+     "arrange_new_pattern": _h_arrange_new_pattern,
+     "arrange_clone_pattern": _h_arrange_clone_pattern,
+     "arrange_add_marker": _h_arrange_add_marker,
+diff --git a/pyproject.toml b/pyproject.toml
+index 84b6dec..3c0a50d 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -50,6 +50,21 @@ audio = [
+     "numpy>=1.24",
+     "scipy>=1.10",
+ ]
++# Studio tools: GUI automation (FLEX packs, render, screenshots) + reference
++# download/compare. Install ALONGSIDE [audio]: pip install -e .[audio,studio]
++studio = [
++    "pillow>=10",
++    "numpy>=1.24",
++    "scipy>=1.10",
++    "pyloudnorm>=0.1",
++    "yt-dlp>=2025.1",
++    "bgutil-ytdlp-pot-provider>=1.0",
++]
++# Stem separation for reference analysis (pulls torch; install the CUDA build
++# of torch first for GPU speed): pip install -e .[audio,studio,stems]
++stems = [
++    "demucs>=4.0",
++]
+ # Higher-accuracy melody/pitch via CREPE (torchcrepe). HEAVY: pulls torch
+ # (~500MB on disk, slower on CPU). Install ALONGSIDE [audio], e.g.
+ #   pip install -e .[audio,audio-accurate]
+diff --git a/scripts/install_windows.bat b/scripts/install_windows.bat
+index 33cf77e..d5cfd19 100644
+--- a/scripts/install_windows.bat
++++ b/scripts/install_windows.bat
+@@ -12,7 +12,7 @@ REM  If your FL data folder is elsewhere, edit FL_SETTINGS below.
+ REM ============================================================================
+ setlocal enabledelayedexpansion
+ 
+-set "FL_SETTINGS=%USERPROFILE%\Documents\Image-Line\FL Studio\Settings"
++if not defined FL_SETTINGS set "FL_SETTINGS=%USERPROFILE%\Documents\Image-Line\FL Studio\Settings"
+ set "HW_TARGET=%FL_SETTINGS%\Hardware\FLStudioMCP"
+ set "SCRIPT_DIR=%~dp0"
+ set "REPO_ROOT=%SCRIPT_DIR%.."
+diff --git a/src/fl_studio_mcp/_paths.py b/src/fl_studio_mcp/_paths.py
+new file mode 100644
+index 0000000..3bc8546
+--- /dev/null
++++ b/src/fl_studio_mcp/_paths.py
+@@ -0,0 +1,95 @@
++"""Resolve the user's real FL Studio user-data folder and Documents folder.
++
++FL's "User data folder" (Options > File settings) can live anywhere, and on
++Windows Documents is often redirected (e.g. to OneDrive), so ``~/Documents``
++is not a safe guess. Resolution order for the FL user-data folder:
++
++  1. $FLSTUDIO_MCP_USER_DATA (full path to the "FL Studio" user-data folder)
++  2. HKCU\\Software\\Image-Line\\Shared\\Paths "Shared data" + "FL Studio"
++  3. <Documents>/Image-Line/FL Studio
++"""
++from __future__ import annotations
++
++import os
++import sys
++from pathlib import Path
++
++
++def documents_dir() -> Path:
++    if sys.platform == "win32":
++        try:
++            import ctypes
++            from ctypes import wintypes
++
++            class GUID(ctypes.Structure):
++                _fields_ = [("Data1", wintypes.DWORD), ("Data2", wintypes.WORD),
++                            ("Data3", wintypes.WORD), ("Data4", ctypes.c_ubyte * 8)]
++
++            # FOLDERID_Documents {FDD39AD0-238F-46AF-ADB4-6C85480369C7}
++            fid = GUID(0xFDD39AD0, 0x238F, 0x46AF,
++                       (ctypes.c_ubyte * 8)(0xAD, 0xB4, 0x6C, 0x85, 0x48, 0x03, 0x69, 0xC7))
++            buf = ctypes.c_wchar_p()
++            if ctypes.windll.shell32.SHGetKnownFolderPath(
++                    ctypes.byref(fid), 0, None, ctypes.byref(buf)) == 0:
++                try:
++                    return Path(buf.value)
++                finally:
++                    ctypes.windll.ole32.CoTaskMemFree(buf)
++        except Exception:
++            pass
++    return Path.home() / "Documents"
++
++
++def _registry_path(name: str) -> Path | None:
++    if sys.platform != "win32":
++        return None
++    try:
++        import winreg
++
++        with winreg.OpenKey(winreg.HKEY_CURRENT_USER,
++                            r"Software\Image-Line\Shared\Paths") as k:
++            value, _ = winreg.QueryValueEx(k, name)
++        return Path(os.path.expandvars(value)) if value else None
++    except OSError:
++        return None
++
++
++def _registry_shared_data() -> Path | None:
++    return _registry_path("Shared data")
++
++
++def fl_install_dir() -> Path | None:
++    return _registry_path("Install path")
++
++
++def flex_pack_dirs() -> list[Path]:
++    """User packs (<shared data>/FLEX/Packs) and factory packs (<install>/Data/Patches/Packs/FLEX/Packs)."""
++    dirs = []
++    shared, install = _registry_shared_data(), fl_install_dir()
++    if shared:
++        dirs.append(shared / "FLEX" / "Packs")
++    dirs.append(documents_dir() / "Image-Line" / "FLEX" / "Packs")
++    if install:
++        dirs.append(install / "Data" / "Patches" / "Packs" / "FLEX" / "Packs")
++    return [d for d in dirs if d.is_dir()]
++
++
++def image_line_roots() -> list[Path]:
++    """Folders that may contain 'FL Studio*' user-data folders, best first."""
++    roots = []
++    shared = _registry_shared_data()
++    if shared:
++        roots.append(shared)
++    roots += [documents_dir() / "Image-Line", Path.home() / "Documents" / "Image-Line",
++              Path.home() / "Image-Line"]
++    return roots
++
++
++def fl_user_data_dir() -> Path:
++    env = os.environ.get("FLSTUDIO_MCP_USER_DATA")
++    if env:
++        return Path(env)
++    for root in image_line_roots():
++        if (root / "FL Studio" / "Settings").is_dir():
++            return root / "FL Studio"
++    return documents_dir() / "Image-Line" / "FL Studio"
+diff --git a/src/fl_studio_mcp/connection.py b/src/fl_studio_mcp/connection.py
+index ae1e194..28dd5ec 100644
+--- a/src/fl_studio_mcp/connection.py
++++ b/src/fl_studio_mcp/connection.py
+@@ -268,6 +268,11 @@ class FLBridge:
+             res["piano_roll_ensured"] = ensured
+         return res
+ 
++    def desktop(self, action: str, params: Optional[dict] = None, timeout: float = 900.0):
++        """Direct mode: run the desktop action in this process."""
++        from .desktop import dispatch
++        return dispatch(self, action, params)
++
+     # -- inbound MIDI callback -----------------------------------------------
+ 
+     def _on_midi(self, msg) -> None:
+@@ -416,6 +421,17 @@ class TCPBridge:
+         except OSError as e:
+             raise self._daemon_unreachable(e)
+ 
++    def desktop(self, action: str, params: Optional[dict] = None, timeout: float = 900.0):
++        """Run a desktop action (GUI automation / local heavy job) in the daemon."""
++        try:
++            resp = self._rpc({"op": "desktop", "action": action, "params": params or {}},
++                             timeout=timeout)
++        except OSError as e:
++            raise self._daemon_unreachable(e)
++        if resp.get("ok"):
++            return resp.get("data")
++        raise FLBridgeError("%s: %s" % (resp.get("exc", "Error"), resp.get("error")))
++
+     def open(self) -> None:  # pragma: no cover - parity with FLBridge
+         return None
+ 
+diff --git a/src/fl_studio_mcp/daemon.py b/src/fl_studio_mcp/daemon.py
+index 8dd27a3..7b88889 100644
+--- a/src/fl_studio_mcp/daemon.py
++++ b/src/fl_studio_mcp/daemon.py
+@@ -133,6 +133,17 @@ def _handle_request(req: dict) -> dict:
+             return {"ok": False, "exc": "Error",
+                     "error": "%s: %s" % (type(e).__name__, e)}
+ 
++    if op == "desktop":
++        # GUI automation + heavy local jobs (FLEX packs, render, reference
++        # analysis). Here, not in the MCP server, because a sandboxed server
++        # can't drive the desktop or spawn GPU jobs reliably.
++        try:
++            from .desktop import dispatch
++            res = dispatch(_get_bridge(), req.get("action"), req.get("params"))
++            return {"ok": True, "data": res}
++        except Exception as e:
++            return {"ok": False, "exc": type(e).__name__, "error": str(e)}
++
+     return {"ok": False, "exc": "Error", "error": "unknown op: %r" % (op,)}
+ 
+ 
+diff --git a/src/fl_studio_mcp/desktop/__init__.py b/src/fl_studio_mcp/desktop/__init__.py
+new file mode 100644
+index 0000000..3810228
+--- /dev/null
++++ b/src/fl_studio_mcp/desktop/__init__.py
+@@ -0,0 +1,62 @@
++"""Desktop-side automation that FL's scripting API can't do on its own.
++
++Runs inside the daemon (a normal process) so it works even when the MCP server
++is sandboxed (MSIX Claude Desktop). Everything here either drives FL's GUI
++(screen matching + focus-verified input), touches the file system, or runs
++heavy local jobs (downloads, stem separation, audio analysis).
++
++Entry point: :func:`dispatch` -- ``{"action": str, "params": {...}}``.
++"""
++
++from __future__ import annotations
++
++import time
++
++# Actions that send real mouse/keyboard input to FL. A stray click or wheel
++# event could nudge a fader, so these run inside a mixer guard.
++GUI_ACTIONS = {"flex_select_pack", "clone_channel", "arm_note_bridge", "save_project", "render_wav"}
++
++
++def _mixer_snapshot(bridge) -> dict:
++    from .. import flex
++    n = flex.api(bridge, "mixer", "trackCount")
++    n = min(int(n or 0), 64)
++    vols = flex.api_batch(bridge, "mixer", [["getTrackVolume", [i]] for i in range(n)])
++    pans = flex.api_batch(bridge, "mixer", [["getTrackPan", [i]] for i in range(n)])
++    return {"vol": vols, "pan": pans}
++
++
++def _restore_drift(bridge, before: dict) -> list:
++    from .. import flex
++    time.sleep(0.5)                      # FL's reads lag writes/GUI changes slightly
++    after = _mixer_snapshot(bridge)
++    fixed = []
++    for kind, setter in (("vol", "setTrackVolume"), ("pan", "setTrackPan")):
++        for i, (a, b) in enumerate(zip(before[kind], after[kind], strict=False)):
++            if isinstance(a, (int, float)) and isinstance(b, (int, float)) and abs(a - b) > 1e-3:
++                flex.api(bridge, "mixer", setter, i, a)
++                fixed.append({"track": i, kind: round(b, 3), "restored_to": round(a, 3)})
++    return fixed
++
++
++def dispatch(bridge, action: str, params: dict | None) -> dict:
++    from . import actions
++    fn = actions.ACTIONS.get(action)
++    if fn is None:
++        return {"ok": False, "error": "unknown desktop action %r" % action,
++                "available": sorted(actions.ACTIONS)}
++    if action not in GUI_ACTIONS:
++        return fn(bridge, **(params or {}))
++    before = _mixer_snapshot(bridge)
++    try:
++        res = fn(bridge, **(params or {}))
++    except Exception as e:
++        drift = _restore_drift(bridge, before)
++        if drift:
++            raise type(e)("%s [mixer guard reverted unexpected changes: %s]" % (e, drift)) from e
++        raise
++    drift = _restore_drift(bridge, before)
++    if drift:
++        res = dict(res, mixer_guard={"restored": drift,
++                                     "note": "unexpected mixer changes during GUI automation were reverted"})
++    return res
+diff --git a/src/fl_studio_mcp/desktop/actions.py b/src/fl_studio_mcp/desktop/actions.py
+new file mode 100644
+index 0000000..21e1886
+--- /dev/null
++++ b/src/fl_studio_mcp/desktop/actions.py
+@@ -0,0 +1,283 @@
++"""Daemon-side actions: GUI workflows FL's API can't do, plus local heavy jobs.
++
++GUI geometry is measured in physical pixels at FL's default UI scale and found
++by template matching (templates/), so it tolerates windows opening anywhere.
++"""
++
++from __future__ import annotations
++
++import os
++import time
++from pathlib import Path
++
++from .. import flex, protocol
++from .._paths import fl_user_data_dir, flex_pack_dirs
++from . import screen
++from .screen import DesktopError
++
++ACTIONS: dict = {}
++
++WID_CHANNEL_RACK, WID_PIANO_ROLL = 1, 3     # midi.widChannelRack / widPianoRoll
++
++# FLEX library list geometry relative to the LIBRARY tab template's top-left.
++FLEX_ROW_DX, FLEX_ROW0_DY, FLEX_ROW_H = 70, 43, 26.0
++FLEX_VISIBLE_ROWS = 20          # rows fully visible above the pack artwork
++FLEX_LAST_ROW_DY = 549          # y of the last row once the list is scrolled to the end
++FLEX_LIST_DY = 300              # a point inside the list, for wheel scrolling
++
++# Piano roll: menu arrow relative to the toolbar template; menu item offsets from the arrow.
++PR_ARROW = (10, 11)
++PR_TOOLS = (34, 72)
++
++
++def action(fn):
++    ACTIONS[fn.__name__] = fn
++    return fn
++
++
++def _fail_shot(tag: str) -> str:
++    p = Path(os.environ.get("TEMP", ".")) / ("fl_mcp_%s_%d.png" % (tag, int(time.time())))
++    try:
++        return screen.save_screenshot(str(p))
++    except Exception:
++        return ""
++
++
++# -- FLEX ------------------------------------------------------------------------
++
++@action
++def flex_list_packs(bridge) -> dict:
++    names = {p.stem for d in flex_pack_dirs() for p in d.glob("*.flexpack")}
++    packs = sorted(names, key=str.casefold)
++    return {"ok": True, "packs": packs, "count": len(packs), "dirs": [str(d) for d in flex_pack_dirs()]}
++
++
++@action
++def flex_select_pack(bridge, channel: int, pack: str, keep_open: bool = False) -> dict:
++    channel = int(channel)
++    flex.require_flex(bridge, channel)
++    packs = flex_list_packs(bridge)["packs"]
++    match = next((p for p in packs if p.casefold() == pack.casefold()), None)
++    if match is None:
++        raise DesktopError("unknown pack %r; available: %s" % (pack, packs))
++    idx, n = packs.index(match), len(packs)
++    before = flex.preset_names(bridge, channel)
++
++    # Only one FLEX window may be open, or the template match could hit the wrong one.
++    for ch in range(flex.api(bridge, "channels", "channelCount")):
++        if ch != channel and flex.plugin_name(bridge, ch) == "FLEX":
++            flex.api(bridge, "channels", "showEditor", ch, 0)
++    flex.api(bridge, "channels", "showEditor", channel, 1)
++    time.sleep(1.2)
++    screen.ensure_fl_foreground()
++    loc = screen.locate("flex_library_tab.png")
++    if not loc:
++        raise DesktopError("FLEX window not found on screen (screenshot: %s)" % _fail_shot("flex"))
++    x, y, score = loc
++    list_pt = (x + FLEX_ROW_DX, y + FLEX_LIST_DY)
++    if idx < FLEX_VISIBLE_ROWS:
++        screen.wheel(*list_pt, notches=+15)                 # back to the top
++        row_y = y + FLEX_ROW0_DY + idx * FLEX_ROW_H
++    else:
++        screen.wheel(*list_pt, notches=-15)                 # to the end; rows bottom-aligned
++        row_y = y + FLEX_LAST_ROW_DY - (n - 1 - idx) * FLEX_ROW_H
++    time.sleep(0.4)
++    screen.click(x + FLEX_ROW_DX, row_y)
++    time.sleep(1.5)
++    names = flex.preset_names(bridge, channel)
++    if not keep_open:
++        flex.api(bridge, "channels", "showEditor", channel, 0)
++    changed = names != before
++    return {"ok": changed or not before, "channel": channel, "pack": match, "match_score": score,
++            "preset_count": len(names), "presets": names,
++            "note": None if changed else "preset list unchanged -- the pack may already have been selected"}
++
++
++# -- channels ----------------------------------------------------------------------
++
++@action
++def clone_channel(bridge, channel: int, count: int = 1) -> dict:
++    channel, count = int(channel), max(1, int(count))
++    names_before = [flex.api(bridge, "channels", "getChannelName", i)
++                    for i in range(flex.api(bridge, "channels", "channelCount"))]
++    flex.api(bridge, "channels", "selectOneChannel", channel)
++    flex.api(bridge, "ui", "showWindow", WID_CHANNEL_RACK)
++    flex.api(bridge, "ui", "setFocused", WID_CHANNEL_RACK)
++    time.sleep(0.4)
++    for _ in range(count):
++        screen.hotkey("alt", "c", settle=1.2)
++    total = flex.api(bridge, "channels", "channelCount")
++    after = [flex.api(bridge, "channels", "getChannelName", i) for i in range(total)]
++    pool = list(names_before)
++    new = []
++    for i, nm in enumerate(after):
++        if nm in pool:
++            pool.remove(nm)
++        else:
++            new.append({"channel": i, "name": nm})
++    if total - len(names_before) < count:
++        raise DesktopError("expected %d new channel(s), got %d -- was the channel rack focused?"
++                           % (count, total - len(names_before)))
++    return {"ok": True, "new_channels": new, "channel_count": total}
++
++
++# -- piano roll note bridge --------------------------------------------------------
++
++@action
++def arm_note_bridge(bridge) -> dict:
++    """Run MCP_Apply once from the piano roll's Tools > Scripts menu, which arms
++    'Run last script again' (Ctrl+Alt+Y) for every later note write."""
++    # Running MCP_Apply re-applies whatever the script last held; neutralise it
++    # first (no notes, append mode) so arming never overwrites the open pattern.
++    from ..pyscript_gen import write_apply_script
++    write_apply_script([], mode="append")
++    bridge.call(protocol.CMD_ENSURE_PIANO_ROLL, {}, timeout=5.0)
++    flex.api(bridge, "ui", "setFocused", WID_PIANO_ROLL)
++    time.sleep(0.6)
++    screen.ensure_fl_foreground()
++    loc = screen.locate("pianoroll_toolbar.png")
++    if not loc:
++        raise DesktopError("piano roll toolbar not found (screenshot: %s)" % _fail_shot("pianoroll"))
++    ax, ay = loc[0] + PR_ARROW[0], loc[1] + PR_ARROW[1]
++    screen.click(ax, ay, settle=0.8)
++    tx, ty = ax + PR_TOOLS[0], ay + PR_TOOLS[1]
++    screen.move(tx, ty, settle=0.9)
++    for dx in (330, 520):                 # slide right along the Tools row into the submenu
++        screen.move(ax + dx, ty, settle=0.3)
++    item = screen.locate("mcp_apply_item.png")
++    if not item:
++        screen.hotkey("esc")
++        screen.hotkey("esc")
++        raise DesktopError("MCP_Apply not in the piano roll Scripts menu -- is MCP_Apply.pyscript "
++                           "in Settings/Piano roll scripts? (screenshot: %s)" % _fail_shot("scripts"))
++    screen.click(item[0] + 36, item[1] + 9, settle=1.0)
++    return {"ok": True, "armed": True, "toolbar_score": loc[2], "menu_item_score": item[2]}
++
++
++# -- project save / render ---------------------------------------------------------
++
++def _projects_dir() -> Path:
++    return fl_user_data_dir() / "Projects"
++
++
++def _newest_flp(since: float = 0.0) -> Path | None:
++    flps = [p for p in _projects_dir().rglob("*.flp") if "Backup" not in p.parts and p.stat().st_mtime >= since]
++    return max(flps, key=lambda p: p.stat().st_mtime) if flps else None
++
++
++@action
++def save_project(bridge, name: str | None = None) -> dict:
++    pre = screen.fl_dialogs()
++    if pre:
++        raise DesktopError("FL has a dialog open (%s); look with fl_screenshot and close it first"
++                           % ", ".join(t or c for _, t, c in pre))
++    t0 = time.time() - 1
++    screen.hotkey("ctrl", "s", settle=1.5)
++    dialog = screen.locate("save_button.png")
++    if dialog:                                   # untitled project: FL's own Save-as dialog
++        if name:
++            screen.hotkey("ctrl", "a")
++            screen.type_text(name)
++        screen.click(dialog[0] + 50, dialog[1] + 19, settle=2.0)
++    for _ in range(20):
++        p = _newest_flp(since=t0)
++        if p:
++            return {"ok": True, "project": str(p), "used_dialog": bool(dialog)}
++        popups = screen.fl_dialogs()
++        if popups:                               # e.g. 'Project size warning' -- needs a human decision
++            raise DesktopError("saving is waiting on an FL dialog: %s (screenshot: %s). Nothing was "
++                               "clicked; decide with the user, then answer it."
++                               % (", ".join(t or c for _, t, c in popups), _fail_shot("save")))
++        time.sleep(0.5)
++    raise DesktopError("no saved .flp appeared under %s" % _projects_dir())
++
++
++@action
++def render_wav(bridge, path: str | None = None, timeout: float = 600) -> dict:
++    """Export WAV (Ctrl+R) of whatever FL would render now (PAT mode: the current
++    pattern; SONG mode: the playlist). ``path`` defaults to a fresh file next to
++    the most recently saved project."""
++    if not path:
++        proj = _newest_flp()
++        if not proj:
++            raise DesktopError("save the project first (fl_save_project) or pass an explicit path")
++        n = 1
++        while (proj.parent / ("%s render %d.wav" % (proj.stem, n))).exists():
++            n += 1
++        path = str(proj.parent / ("%s render %d.wav" % (proj.stem, n)))
++    out = Path(path)
++    if out.exists():
++        raise DesktopError("%s already exists; pass a new path" % out)
++    out.parent.mkdir(parents=True, exist_ok=True)
++    open_dialogs = screen.fl_dialogs()
++    if open_dialogs:
++        raise DesktopError("FL has a dialog open (%s); look with fl_screenshot and close it first"
++                           % ", ".join(t or c for _, t, c in open_dialogs))
++    screen.hotkey("ctrl", "r", settle=0.3)
++    dlg = screen.wait_for_fl_dialog(timeout=15.0)  # never type until the Save dialog has focus
++    if not dlg:
++        raise DesktopError("FL's export Save dialog did not appear; nothing was typed")
++    screen.hotkey("ctrl", "a")                   # the filename box has focus in the Save dialog
++    screen.type_text(str(out))
++    screen.hotkey("enter", settle=2.5)
++    if dlg in [h for h, _t, _c in screen.fl_dialogs()]:
++        screen.close_window(dlg)
++        raise DesktopError("the Save dialog didn't accept %s (cancelled it)" % out)
++    start = None
++    for _ in range(10):
++        start = screen.locate("render_start.png")
++        if start:
++            break
++        time.sleep(0.5)
++    if not start:
++        raise DesktopError("render dialog not found (screenshot: %s)" % _fail_shot("render"))
++    screen.click(start[0] + 46, start[1] + 22)
++    t0, last = time.time(), -1
++    while time.time() - t0 < timeout:
++        time.sleep(2.0)
++        size = out.stat().st_size if out.exists() else 0
++        if size > 44 and size == last and not screen.locate("render_start.png"):
++            break
++        last = size
++    else:
++        raise DesktopError("render did not finish within %ds" % timeout)
++    info = {}
++    try:
++        import soundfile as sf
++        i = sf.info(str(out))
++        info = {"duration_sec": round(i.duration, 2), "samplerate": i.samplerate, "channels": i.channels}
++    except Exception:
++        pass
++    return dict(ok=True, path=str(out), seconds=round(time.time() - t0, 1), **info)
++
++
++@action
++def screenshot(bridge, max_width: int = 1600) -> dict:
++    """PNG of the monitor FL is on (never other monitors), downscaled."""
++    from PIL import ImageGrab
++    rect = screen.fl_monitor_rect()
++    img = ImageGrab.grab(bbox=rect, all_screens=True)
++    if img.width > max_width:
++        img = img.resize((max_width, int(img.height * max_width / img.width)))
++    import base64
++    import io
++    buf = io.BytesIO()
++    img.convert("RGB").save(buf, format="JPEG", quality=85)
++    return {"ok": True, "jpeg_b64": base64.b64encode(buf.getvalue()).decode("ascii"),
++            "size": [img.width, img.height], "monitor": list(rect)}
++
++
++# -- reference pipeline (heavy, local) --------------------------------------------
++
++@action
++def reference_analyze(bridge, source: str, stems: bool = True, out_dir: str | None = None,
++                      bpm: float | None = None) -> dict:
++    from ..music.reference import analyze_reference
++    return dict(ok=True, **analyze_reference(source, stems=stems, out_dir=out_dir, bpm=bpm))
++
++
++@action
++def compare_mix(bridge, mix: str, reference: str, mix_range=None, ref_range=None,
++                window_sec: float = 20.0) -> dict:
++    from ..music.reference import compare
++    return dict(ok=True, **compare(mix, reference, mix_range, ref_range, window_sec))
+diff --git a/src/fl_studio_mcp/desktop/screen.py b/src/fl_studio_mcp/desktop/screen.py
+new file mode 100644
+index 0000000..2ba3ed0
+--- /dev/null
++++ b/src/fl_studio_mcp/desktop/screen.py
+@@ -0,0 +1,235 @@
++"""Screen capture, template matching and focus-verified input (Windows).
++
++Safety rule: input is only ever sent while a window belonging to FL Studio's
++process is in the foreground. If focus can't be confirmed we raise instead of
++typing blind into whatever app the user is in.
++"""
++
++from __future__ import annotations
++
++import ctypes
++import sys
++import time
++from ctypes import wintypes
++from pathlib import Path
++
++import numpy as np
++
++TEMPLATES = Path(__file__).parent / "templates"
++
++
++class DesktopError(RuntimeError):
++    pass
++
++
++def _require_windows():
++    if sys.platform != "win32":
++        raise DesktopError("desktop automation is currently Windows-only")
++
++
++_dpi_set = False
++
++
++def _dpi_aware():
++    global _dpi_set
++    if not _dpi_set:
++        ctypes.windll.user32.SetProcessDPIAware()
++        _dpi_set = True
++
++
++# -- focus ---------------------------------------------------------------------
++
++def _pid_of(hwnd) -> int:
++    pid = wintypes.DWORD()
++    ctypes.windll.user32.GetWindowThreadProcessId(wintypes.HWND(hwnd), ctypes.byref(pid))
++    return pid.value
++
++
++def fl_hwnd():
++    from ..pyscript_trigger import find_fl_hwnd
++    return find_fl_hwnd()
++
++
++def fl_is_foreground() -> bool:
++    """True when the foreground window belongs to FL's process (main window,
++    plugin window or one of FL's own dialogs)."""
++    h = fl_hwnd()
++    fg = ctypes.windll.user32.GetForegroundWindow()
++    return bool(h and fg and _pid_of(fg) == _pid_of(h))
++
++
++def _class_name(hwnd) -> str:
++    buf = ctypes.create_unicode_buffer(64)
++    ctypes.windll.user32.GetClassNameW(wintypes.HWND(hwnd), buf, 64)
++    return buf.value
++
++
++_FL_CORE_CLASSES = {"TFruityLoopsMainForm", "TApplication"}
++
++
++def fl_dialogs(standard_only: bool = False) -> list:
++    """Visible top-level windows owned by FL's process other than its main window:
++    Windows common dialogs (#32770, e.g. Save As) and FL's own popups (e.g.
++    'Project size warning', confirmations). [(hwnd, title, class)]."""
++    h = fl_hwnd()
++    if not h:
++        return []
++    pid, out = _pid_of(h), []
++    u = ctypes.windll.user32
++    proto = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
++
++    def cb(hwnd, _):
++        if u.IsWindowVisible(hwnd) and _pid_of(hwnd) == pid:
++            cls = _class_name(hwnd)
++            if cls not in _FL_CORE_CLASSES and (not standard_only or cls == "#32770"):
++                t = ctypes.create_unicode_buffer(128)
++                u.GetWindowTextW(hwnd, t, 128)
++                out.append((hwnd, t.value, cls))
++        return True
++    u.EnumWindows(proto(cb), 0)
++    return out
++
++
++def wait_for_fl_dialog(title: str | None = None, timeout: float = 10.0):
++    """Wait until an FL-owned standard dialog is in the FOREGROUND; return its hwnd.
++    Nothing gets typed until this succeeds, so keys can't land in the wrong window."""
++    t0 = time.time()
++    while time.time() - t0 < timeout:
++        fg = ctypes.windll.user32.GetForegroundWindow()
++        for hwnd, t, _cls in fl_dialogs(standard_only=True):
++            if hwnd == fg and (title is None or title.lower() in t.lower()):
++                return hwnd
++        time.sleep(0.2)
++    return None
++
++
++def close_window(hwnd):
++    ctypes.windll.user32.PostMessageW(wintypes.HWND(hwnd), 0x0010, 0, 0)   # WM_CLOSE (= Cancel)
++
++
++def fl_monitor_rect():
++    """(left, top, right, bottom) of the monitor FL's main window is on."""
++    _dpi_aware()
++    h = fl_hwnd()
++    if not h:
++        raise DesktopError("FL Studio window not found")
++    u = ctypes.windll.user32
++    mon = u.MonitorFromWindow(wintypes.HWND(h), 2)
++
++    class MONITORINFO(ctypes.Structure):
++        _fields_ = [("cbSize", wintypes.DWORD), ("rcMonitor", wintypes.RECT),
++                    ("rcWork", wintypes.RECT), ("dwFlags", wintypes.DWORD)]
++    mi = MONITORINFO()
++    mi.cbSize = ctypes.sizeof(MONITORINFO)
++    u.GetMonitorInfoW(mon, ctypes.byref(mi))
++    r = mi.rcMonitor
++    return r.left, r.top, r.right, r.bottom
++
++
++def ensure_fl_foreground(retries: int = 3):
++    _require_windows()
++    from ..pyscript_trigger import force_focus
++    h = fl_hwnd()
++    if not h:
++        raise DesktopError("FL Studio main window not found -- is FL running?")
++    for _ in range(retries):
++        if fl_is_foreground():
++            return
++        force_focus(h)
++        time.sleep(0.35)
++    if not fl_is_foreground():
++        raise DesktopError("could not bring FL Studio to the foreground; refusing to send input")
++
++
++# -- capture + matching --------------------------------------------------------
++
++_grab_origin = (0, 0)
++
++
++def grab(region=None) -> np.ndarray:
++    """Greyscale float32 screenshot of FL's monitor (physical pixels)."""
++    global _grab_origin
++    _require_windows()
++    _dpi_aware()
++    from PIL import ImageGrab
++    region = region or fl_monitor_rect()
++    _grab_origin = region[:2]
++    img = ImageGrab.grab(bbox=region, all_screens=True)
++    return np.asarray(img.convert("L"), dtype=np.float32)
++
++
++def save_screenshot(path: str, region=None) -> str:
++    """Save a screenshot; defaults to FL's monitor only (never other monitors)."""
++    _dpi_aware()
++    from PIL import ImageGrab
++    ImageGrab.grab(bbox=region or fl_monitor_rect(), all_screens=True).save(path)
++    return path
++
++
++def locate(template: str, img: np.ndarray | None = None, min_score: float = 0.8):
++    """Find a template PNG on screen by normalised cross-correlation.
++
++    Returns (x, y, score) of the template's top-left in screen coordinates,
++    or None when the best match is below ``min_score``.
++    """
++    from PIL import Image
++    from scipy.signal import fftconvolve
++    if img is None:
++        img = grab()
++    t = np.asarray(Image.open(TEMPLATES / template).convert("L"), dtype=np.float32)
++    t = t - t.mean()
++    tn = np.sqrt((t ** 2).sum())
++    corr = fftconvolve(img, t[::-1, ::-1], mode="valid")
++    ones = np.ones_like(t)
++    s1 = fftconvolve(img, ones, mode="valid")
++    s2 = fftconvolve(img ** 2, ones, mode="valid")
++    var = s2 - s1 ** 2 / t.size
++    ncc = corr / (np.sqrt(np.maximum(var, 1.0)) * tn)
++    ncc[var < t.size * 25.0] = 0          # flat regions carry no signal
++    y, x = np.unravel_index(int(np.argmax(ncc)), ncc.shape)
++    score = float(ncc[y, x])
++    if score < min_score:
++        return None
++    ox, oy = _grab_origin                 # grab() captures FL's monitor; map back to screen coords
++    return int(x) + ox, int(y) + oy, round(score, 3)
++
++
++# -- input (only after ensure_fl_foreground) ----------------------------------
++
++def move(x, y, settle=0.12):
++    _dpi_aware()
++    ctypes.windll.user32.SetCursorPos(int(x), int(y))
++    time.sleep(settle)
++
++
++def click(x, y, settle=0.3):
++    ensure_fl_foreground()
++    move(x, y)
++    u = ctypes.windll.user32
++    u.mouse_event(0x2, 0, 0, 0, 0)
++    u.mouse_event(0x4, 0, 0, 0, 0)
++    time.sleep(settle)
++
++
++def wheel(x, y, notches: int):
++    ensure_fl_foreground()
++    move(x, y)
++    for _ in range(abs(notches)):
++        ctypes.windll.user32.mouse_event(0x800, 0, 0, 120 if notches > 0 else -120, 0)
++        time.sleep(0.06)
++
++
++def hotkey(*keys, settle=0.3):
++    ensure_fl_foreground()
++    import pyautogui
++    pyautogui.FAILSAFE = False
++    pyautogui.hotkey(*keys)
++    time.sleep(settle)
++
++
++def type_text(text: str, settle=0.3):
++    ensure_fl_foreground()
++    import pyautogui
++    pyautogui.FAILSAFE = False
++    pyautogui.write(text, interval=0.01)
++    time.sleep(settle)
+diff --git a/src/fl_studio_mcp/desktop/templates/flex_library_tab.png b/src/fl_studio_mcp/desktop/templates/flex_library_tab.png
+new file mode 100644
+index 0000000000000000000000000000000000000000..8688ef0df9f6749359869238a56e4877b266584c
+GIT binary patch
+literal 1620
+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
+S8JqL~0000<MNUMnLSTYnYbDtL
+
+literal 0
+HcmV?d00001
+
+diff --git a/src/fl_studio_mcp/desktop/templates/mcp_apply_item.png b/src/fl_studio_mcp/desktop/templates/mcp_apply_item.png
+new file mode 100644
+index 0000000000000000000000000000000000000000..962a551f9af95e9dc0db9d1a86504edc5c885913
+GIT binary patch
+literal 1621
+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
+T8=4k-00000NkvXXu0mjfpmifJ
+
+literal 0
+HcmV?d00001
+
+diff --git a/src/fl_studio_mcp/desktop/templates/pianoroll_toolbar.png b/src/fl_studio_mcp/desktop/templates/pianoroll_toolbar.png
+new file mode 100644
+index 0000000000000000000000000000000000000000..9d942eaff28a061a022f0120f173bf66555b776b
+GIT binary patch
+literal 7685
+zcmV+g9{S;lP)<h;3K|Lk000e1NJLTq00F50000*V1^@s6v74~!0014#Nkl<Zc%1E>
+z2UL`2`u2bC49rl50qMOXV4<kkqF7^ZF;NqZJw{X9#B52~{kEO`cJnv8n{1jTwh&8<
+zi5ffBD0Weaf?z=b>AlVX)Ba}$3r(HDk+|Q-b<TSZXL#p*p7&|j{oMEU+#?JcHC{&t
+zI?#a*bf5!IAw<7)1v=1y4s@Uc9e5BrNU8%JXd?uXxZNgDdzRIK4m?e;;HiWNTd(f)
+z?HPu@hck8(EsC;2vePedCh<BYs<u8?z}72*e*JpTHNXouX9r|b5xV*s%8ClfzL~;>
+zGp9+)R-olc!3O{EPUNTNP;1V|3Q}A{qlpah!P~<bxm1j{u9Bj>9I~!o;{4Sj>N*^|
+zW`qY5e*ZSn**jRZ@g&(#v~i6rOB%`x3r1r9^Cs3N6g|N){A3^r9>;<)a?Y;Z#JQ@D
+z!TKmz$o+}x)s0{u4_xI|2<jS23v#%XdXdDmLTYvYZ}ijCM^aL622Pp5q+aewoBX3Q
+z5xoX5a`bf$ZQj7HlnT=(p{Ns4lV<VaK!0RHv;RqCID6@@K%xc=<yOLXtlfTz(kC&?
+zMb5;$Fdf~-kNG~m&I}I}<JfH^(<a6e?jmhrZHIP=hGAowT$IYuAHQdBav5sO1pzB(
+zXT-%t)bPu|r&}G9TpsXGorr`}mL!>@nOndTsih^(kuUI$yD#6a-on{J^R;Z7$`aY(
+z84!R|wv^^W++>Jlcm)OF=jDc@jTnuhjQpHTuBYcwt$Eysw^p7Pqo)ob%(Z}PmXG%+
+zkzEL}{oTkpahA%ESbBT4-X8V2XE~TEXW+0fWSV+v$_vQ2n#QftdY)>Ev~;1zxM@5;
+zAP9SLv;T#5r%&uiCKmk6-p$|h)6E+58Y^b(r~giplKM0L%|(pxdGI6?%R?A3e+kYT
+zK4IPYaw9vymWUVMWKM6#N58OOOF-;w-m+TDKQ|>~c0<A54<ET3K9h%X_LIG2sUBxG
+z+7mf>0WS~m!Ws<~85cNnA%z=Rd6d*>u#h?7;S)%=o-suFbz$Ty@6sh<11q*&ru?x-
+zu7H)_a2CBJXWRe$K+P{StG&bOc|Pn;;U!{jDjG(P$XbKHvySI|bu8E@;kudlLnQYm
+z#KQ&w7aZ;^5E8fE%zVcK-;Hb8cBu?=t>MO&b?-ijJJteNI`|SAYJ*l)M#ilo(=2L{
+z9ic-fF=0?7zINgk^H5!No1~*V*?Raom1bN0Bm|D1$q-l3<C80(t;!-(G?rIhcVS~(
+z8j|6280;l!@$8z5w>Waklm5ep<8klHH4R4Uj!Tpp-H`(F(BVuT8AF(l6SkHO@1gv8
+zB_FI!<?a*@pZ5`OL^P~G8dWvLx36(FemncGRvAr-f^BCeE}F|QA1idVg`}K3P2!bX
+z<doE)mD=O(6GCL4zC`;)G5HOD0>59z*QW~a)!}LCr~g8dk`ngZY@TgIQ0l_7Y>L~(
+z&t($ad;<s!@Fy@JfB-)aqNh&h+Rf!0FMIS%v5A<%OEE?e)IErB>ir^9lmE_|OA51E
+zRZ@=tTrI)UYcS9EPvq01MQvQvZ0I)iP3HD>My$x-@a7Hd{JFU4U@R&m=T<6-$Kr8`
+z8pq73u>=mB&07|$`PX-;RO=p-pcalMSbdVG0oq$uEc#BuwYv@AQ_JC5^@x0H`D~)V
+z?5&m*n4u%B!Y1+B^q>}FNwD%^@Z4YHeefGr@4ZTuw*AV|G`}xu3a>{2Wye_hw{2t@
+zIlu&)5XLW<!|(tbM7mn?uU_EFtz3$$8VnxapfJLNedsmrHNv|dWc62jxu$sBMzzFi
+z@H}1}<YvajsE%9ltJ!S7m|3$RE^ZynY@MiDKx9k6pqVVT-N<K~E*eEtg6nWzUoZym
+zCNH3-ytulF5nWwUh6)$-8xXOj47b1@j9=i2Zt2JDFEnDnShzB1uAZQzC^C+)A#M+8
+z_|vmzB!ha$pyV?959}rB)KC00a2j(bL=yGF0&2?t&8Ac(PhUS72cyaxHF6~T;^Uue
+zO`M)#QjEiWca=7e_%+{gCcj~nWTuvonVQHElOOC%?C9>;nN0n*M2_l@bMiro%w{nP
+zI0brRZTMS4;II*do!vl68^(`)@0Xd`#~E?;6*hmmmg5g~HK{2|+RmrBMZEf}=jqb#
+zWnNBS%8JB_HV|+lg0c~yl3yMLQeJONP=MS)i%8$+RRUJwO1>B_V(vllWABVLb+ra}
+zX{!@QuqF7}S9#BSH>=`~a7(Fcr?S4_?YDJc-HTuSZ3a#W|KhLPvrRL8EW8-C=oOyz
+zl~A91nl0<Mb0)X0+4vB!4xP&Ti~8ai@GJ`#srdNQ17x>pmny>AHI!#YO<;77=B|A+
+zKwHJ7?^j_z?@i{+f_0`46&ASkn$BV{il{vL^ubf#NxCYo9o@^J#58W^SD;ikT{v$4
+z_z!-)+X@GFf5LkWW$d6}<QCrai*e=P?)*o1g+w^_o67iLE7bW%S+ydb+L)QVKRyDN
+zJ8rkSj9d=y*VjWy=CN=1TqWT*)57UHWjq&`en(pElj$e1-$dSjtp|DEE@e$p4X(qN
+z@arLU?ELp~5=yk~LsA3!_d_O=v2FV{G@2(9j&+Rafkz|%sxl>>p9;+2IC1GgPq*fg
+z8ZD)l_poKp8PW>tuyPHd@0b@D*S!;sUA!XCp7d}$OnkAq-q{X6KRF^r28q`#=@Jpi
+z$e6vP9xFA?Z!8I8(u6Q<so?bb^_(y=7NRaZ!P<>}{C+_U-6oAA^wI{>>P;zFz{>ww
+z7QH&EfuQuTjbO%GUMTfG{jvhGu3q5eg$yd6MBL&*C>3+7@fK37VeT_(P+RcD*H&1K
+zuVH>41s_-0^7?5JCcUyAcG1k3JrGy1ih{&r?7beyq!8-|EOr87u@;S;JC5~vCb*2u
+zP!?^47~e6o809NLb$dUbeZG&3R>T>CeRp1%5<{mum67_6V$SGP{;|_oLbN7e;8;dP
+zdDF?k8Fwe!2P{AW4$)JX-M5OJYxZ&TZe0W!-JhSspt}96*>#OaZsOF1Bz(OF`5OzF
+zI}6sDOjJ{umUf+GiPaCiQ|>HBKuy-}&-vnD;X~R&hgPkmG&_|O*;lzyvxN7?dLwhu
+z8|RN8DNAo+2L&S46!X(}dnpWmiFcoiKz`>%wACqmA9s|3dk@i2eC9iLM7_)O&>lP+
+zxsS9n##)rd_EQ6-Zaz3$$q{+U5Rz(e^!3EXwiZ7Jky%K}XjN-eM0aM+n1MuMcALil
+zCvT@lm8s!!!WACV5H-LipffJb-cna`lvQ6J;&NU!DvgS&yek}7x0a(V$jFtj05iU?
+zg)2esVzLi!;+wT!u=Z31UNMn4nz+lei5NnpOrSPx2ivYH?^(OfJx4KN+}IY^=pHWj
+z+E#gGJ3n5nLnn)5cz1og!+2PF4rXCvg3?25ho`?kK|y+9%Rt7>Sj_v2hT|*Ymw`yj
+z*a=FWbJoWMr0ggc@y!++;!AV{4^!~Bt~%4D+;tVy%6$n8=uH19v+1wCNp7oFsgCMv
+zJNR;|f)TGTW?H0a?fckesq;8@=pYH#DorzbY@--Iz!kA7lihLg4<M)rW-OjXZ)Y(=
+zeKrR-#FMEK;XZIIJ#3A8OY4XiSvdI_x(E5;{m_Na0;k|G0z*fzaQ*<?43?t=|1k@h
+zGa!hd@Bkc)ZP>aD_I|a23zGiKn-xadH|zK*$5>&6fQ7}QM~ff`2-++XPMYGn*HUou
+zM1w0<|NTeYEq3lkS0@2g{uz$tcrtR_eS$()&E;*IIo(|8r7h>;(JNFT#ix59wno;>
+z_<m|1m^5F5gMxTv-W+5yTk}`MqVXQ4o*Jcjb}!C8&MjWD<mW_knr}Wdw>g{KTrnuZ
+z(aWjH?&`7N6pX*LfD1{*Xi$>+(>Y4yK6qG}@(>GxBK@(XmbBx^O#}<J?tuga1+};W
+z-5W2K3X&48Qi~=2Q2{0mKnr_!oU9%-okZA$j9}Wp`^5OfVWlI`QA<Q<J%65C!*9Db
+z^rB9xqm#Z8wPKcTvgWc<OYaE^-tp6!MjrJy*}iHQHw|QAiCcJAJgxLJ@c`0TG>u3H
+zYr+QgxWACJM_K9|PVL#v!7G&}xpA$-dJ`;xn#=JdwBp;oOHh685Y&N{U-IL*L+nXb
+zppyjCC)5~2PC{6}aE#+K73o`7u>FP-o6eJXV|p|}1Lv}6xHp!Sm)N-S0J$bC58A3^
+zzFWDC>vjVkPE@*jO7rrmXoLGwSDt11F@&0IvMP=Hj+MKIA!MP<x<Q#^7s47@w)L5Z
+z*nY8f@r5$`CPixfZpRC`Q6-tuPwfMfNz&89g9Y>FvuybaYU|9W?NwCNpu^$L;?aqy
+zK3@EIJL|FK($?~p)@)TlX{#1bMS)%|*s00lYHcqwo07#LC<uqjtEAqQ*45XbsH>&c
+zB$tpQKCTuB<Zvyssb(j0_m_NZ#1m9G=@e=r@N@OTUX+5d-b`ic_bl6L%bSzCV*gME
+zvc$Vj4DN^bklP-rzW^o6Ucd9VRv;%?N`_lK&vaApmCl9*J1xjBx8%JoTGq^{W873F
+zh3jmHD>A+aP2o{iZSv*aInf3yUU(>JG^n36%IY?qRcX(%^l%MyM~sH-<eM#Ap{)_r
+zjvEcT_w?i(G|?fr1-K%<koAaNL?^uU&oH)9ngWijT7%=;3mM#V7H{_ip)Ql1E7x<b
+z4boI~;Yrr5w&%^)o@L%FSQEF7>aLC7Rzu;j<@{q?29{lB@P}7>8o8)L>YCpg;#a04
+zn;-u24nG)ir${12j1Gme4#CD2N#otp{xc7bn`@LP)eYY_Zm~D9pV|R!GIpID9f^+8
+z%ZJPb2~tthR_+utk|;CKxlXG!>N7pGI-Sw?nhq)6As*CcT&MUB^NQ?Tu*gg%+oT|g
+z6kGjnMx&srndPRJxPJc0$1Sdp=7t*-MfaenZ1CqxY-#Mddo)z!9siooen_F>ZnIRL
+z;G-o=c=PSw@ZLw?a5$r30TbK%;w$5cBPl`3rMn@6QVAcfkn!?%DSwEwVRxZ`U3Udv
+zjaTC#f|}b>7VosAPNHVsbR}c#OeslcAnDbI^P0(dTapH~H#v0dHWdZMZ8Wmlvn;Td
+z>0@3>%BwU+6O<mc6_tkiN$rerYf7+|m^hznZ?J9aWy7I&{WnWaZQ)>c+r`wi8S$)K
+ze}+o8Si_F$_L-YBHnVkV6<Ty?)as}1oRqqz29-W0EVqNAn`A3=Xq5R}_;C$et~^+I
+zB}na&OZ3Y{b(42BYd<}WBvo8e%EhE4GgU!~@6h?Y@{D8C%1FbR{8ArW@6f*>k>eE-
+z&7jfGGw-#<ELl8*J_cXT!%?rSe}rrCKE&dd&r>OzE1cR03s1TQSW=LFKhuPxS3L>w
+zS20c8r=niJ8i}M>HG7TBeJlBV*|HYb%6*wl7chx6hH<E_qu%6~Q;~l{PgKdx&RS`x
+z&bh$$xZT{)H@R4b{K<qbn?PA0VaXaBjuZ>vsA5Kx#t`GvDaHKrn?^)6p@FChQ><BX
+zObm7^emA|2-bTAx#RSJjP_}0^Td&?dme4wB>|VZ^Y<qiTPMzB5&u`DNKvkz-_$Am#
+z1)~W{4-0E+Lz(JYW2`I<^`?qQ1P6Kz2)?H%bBGu~*kc*4S}HI9!1AqEsPl;B<%uEp
+zcO-~$?K_%2?monhj>4X&3$=Nf1`&>RKv%pJiLChJ`~2<?|HGQ2w;z(ZMnE1CW{Alv
+zvNI_+s-!mb)6+&$xp{f4TD{slu0BCV_{2B()r8K-gnII?Wj2xs3&^`o<AXnc!29q0
+ziH|<~3-7-%izy=q&?D3ro2-*08F5BRS*2_dM7EH&uI{n4vTX5rZKd7~X*$GqK1B2%
+z#@Nxr8PL@Oxla^fcBNduc{ewM7)A0S&J~+FBFf3t2S^1+{2I$4^@0kIAUcPHw77yj
+zY@587;Noi-xazX}HXiEL6IC3aw;(FemZgzas&6qZ+IBKWHI)|pb)5~HZ-Y-i1#!=-
+z2(i3RRJ#fUWZmu))s+Mr{&GnKE_E!OT2F{ktGfv6pjcwv%1HQn17}J#4<wDE0k1M6
+zQjT@lD1)TibhKw#P<&e-@R#5f;%11yHYKRr>~Dpj^z+lRv!}rYRhn&#V4#9RlLng=
+zA(IyJQiL7q+~e#zUjmMOnY&;Z-j9{(Kuy7kIKJASg~~$jHop(SwhPnWdxweU6ib;2
+zy0T;vv(<>5dNHbpy}`h&dsL%K{1`ek2rFGBspm6{RJEGgPfr<1-AGSo)tYrw*O(y*
+zj@X&rGu~q15Ff16C0y9@A3j?4Ise&}*`zToWG;BQJ79IUrrIj5A6&(!J8l`ZeXS~K
+z8Bmm1x1Q0W<>xx8%c@LHD`Fiok>C7b39n8a$LNt`d2zvS_|u~PI8~*Sc29w$K~Y`T
+zhLk0>q^IViK~DGHeofqX#tA1Z2=3DbnV=&t)wni%I8miEJ$t0nVmPHxUrJ#+=1S7l
+zidnY7md{c}*oG<jYGxhJ*ftQ=zt%S=DuE-rZCITtfc~)WIQ2bQ^@AbCLhMSv!9iFm
+zuCRI8fB2+vTu4{Nl>^67#J<YRUQP|W8VgTGzPW^1vB5Z)w9RSHvY_J1WrK9tvDXm7
+zUG)Stvk^fpV`mG3(sM{Rp6y|eNS8}esxgLK4XHop80nG};WBU@3u4_7l_e6ld@K7l
+zE@w+x4HEw`yfz~md*N{p`>rDHjEP4-9ss?Y{j)z##K&ZXl{YW^>EA8g@vT8y%&EPJ
+zlxl4VpERAp9*_8j$c}E4rZdP*Ozo}1?7L>{OgE*U+6P7t=cG%Q*}82TS~J9G1X*Xs
+z&!5e+0XAqWuCQ&*dJbpSV&y-C=VHAL9j2=<Bd=V9gQFc*B8?%zY|hPO&Kx_&x!cBP
+zflw5eQdgYGM}OZ*juw2M|1%3@t^3feY^^9e`fvWa?KT=bnf%9vSe2UEU3PRI))${f
+zt`q&FlS)NYUP>m{4Eae)6Hjn!)Kr3dO<>TG&p249F<Lkwavj8^o^nL08zh`Be@s`V
+ziu}u|O+T{rCBQ*InUz9@Su^Mw0kw!9w%SrOLcw2S>iEC&wS4)lHCqZBh)Vaeg7JEy
+z!iEJqEcj-Zl<}|C;_9WrS+Jn&p^YIR(t8P`h7h^^28l(tDRz*MdLadum_VfE`RM$5
+z5arhNOp`uUQSZrb&|~-wj()$1otH|DSOD6yEJLt|eJMkk*FBo~zl$=+t{+NJf{f^C
+zFA!-fP;+TNr;JQ;S$6VUw))RxY=j3k;^u;o#t>mGw?(YH#@1!ul4MZ86?1&eS2!$w
+zjaZqi!Cn10gI8NcdRi6OcSfbJ{$ol}1qWZer2@B2$-rUjjgJZPPi5MVd~?i?*9Ldy
+zxi??O>4#11xKP+)ha|EKWXKCIF)q>>QS}wJZAdUFA%XGz^c0cQ@sp>_mT^Mr9m||o
+zCeY16MD>k$)~$=@YPBU^17@*cQWVY>`s@flvi^r-q?;qROlb}!c43CtR!%+CRw<GC
+z*c!%U)7`QN8#^g=8F#Egi7OuR3X+XUSJDJp{br&SRFHD+mU%LtSDs~S!XVxm=Es=X
+zqe%aB54Vhwzv^=%&KZfXrH1^2KXTSc`K!?otOy!5k}lE$65^A7nPe0?fn)JDyjiK_
+zlc6eJpRL7bs|_EgHxLzfiAu2HcNuD2^#h?=)aVf8gCI0yu#j|Sa4&n#A1g;)p3aFK
+z`m6DMmUs=E&FgvvWTV+_ArEHQ+{M_gT*`*jRu=wWtSmhgT->~cB>!1N+llnPB~Gqc
+z-a0`^Jm@!d4pXA#2vtdJ-g4Rayp5_nj(xq9V}cl|+@0XA(F_<ekZvx`-S7H?vH#@V
+z{Q_zOgWN%VCc8fQ1A8@Uv*kymHlN&T@HJM-*9vqx9XgROvCp`2_CSG=bra+M%mDnv
+zP_O^Kah2uzjuosG<})+apTV=<C1%8RQm$r@TUvuwVvnnL5M8_Y)5#K4Wyx&coQV7E
+z4|uoiJO}n3=3>4PF?OT-sR3$*0=?v<wz}cj%4+?%siVqF$B2v~DYK<SvIu6%!bx<u
+zt0m*74XoOcLb=$5-qYtZt+yM}`U1{uj^n%2x#s&>iHa<8R0HvM6>~9LgQ8M_L~du;
+ztu@`$*y1P?P*&dgnGV+g+-kDfXL4?`8h+lhpDSKt3Aev1<<wD~x}W`K$$GAbhO9kb
+zvp4uH#`z8Bjm1(ntlPoGyRyMnVCfviq&Y7V>uE_{#xB<E%Qn-NUO-~+NpNU55i$LV
+z@m6qd(^_^mNdeK`5J)~{!<;H5pN~^9ep(G)`)&9ju@O;qRq$nK!`=DU#l~fEHw*<a
+ze*JpkeEdP_vQ*?GtY@R&`z-7wM}(G=i#ynQzMih*CevqRG(V=Dd~|xI_AE<}>LlWp
+zcf$I$@r24c5%bb~#Ahy&d_9YzY87HTSA2rH64N)DKzj>x)mPcJd?Odyl4nY%p{^o_
+zl#@B6oI6Lq=?i%=x@oo-eFLaftvuVD1f@q^2B(sWiHUV?^LfaMV*R-^Cw#`d$zu6_
+z4xdlsR(=`Pwarz60v1wRI(hihrRPva4e&B7z@<fH#=9N06<pr-DIZ=P%A_#^iSQ1k
+zw|i*QTk1-<di)^Ucb!8$^tZh4>x9U61arIfB5KQW;!YPCH}{R|C#X+e&xikXK$+X%
+znaSAtFFrh`B|pC%Ny=;xBuFg;P-JrYL>g805lor)60ts3sPaw|w{|OM3(dT^=?X|M
+zuqQUi4smX!K?tF>aWtIsQ8Z~o8IE=;s%o@|L?Swc1R^UwMs6EsM1A%VzWm!o{KLWt
+z_K=}2xWc*1In<al9;wMAe#I)J3+MB!-$3U5E{rRu5=c0AnH#y~)EZnEQXD*kh>UrL
+zLH)YmDgkBY0amU&OzvYclwfI#ldC)K9v*nP$PjDl$UeD|!>Q>MKB*tFF%j9x*379E
+z@#&O0dW@=JRVQnf{3PZ;q6I@otFYCNex)U=lSD==d>ZQ2cizj=s*x(JHPn)__bA!X
+z<M9=jaBg1$KNo1p=+uYaLtWA99-67Wf5EcuLzQ!cFPG*pV(Jt|bPJ@<2>sRUCS5&6
+z$$R*A^C7O9!_%QE;M6x?AhvmjX`yY%(DB%)=jPr`9PpXX2z_GRHasE!^eM7q$Kh)!
+zBY5Csf(Pn9Ra0>IGycBg{`oPVNgwdeVCSasCsh_F&zbt$UusIP>}SoD!`ONF6XfTG
+ztGyK>RW&8~x4D^qo02<LzBus=Swkk^ZwZ3fk?6_Oxpn<hj+E%k*iZG8WEVE7UIjV%
+zm<{bqQmQm|?7czg<S?c#UP7#eCmuE$iY|P|s&7w`YjRRGW1t`-y@Y8K{}2D3c;_Q!
+zy@90i8jlP?hNF#??(_d~FRoL#Kcnr!0#!K~mrs##nI{Lu4R(CGl#DUcnKmStu7f5U
+zF0Hy2g;Imq+6F6&J1JMRm0UZth4p)rF*(fE3UsO(igVHpS29m8$}^<A`n8A;Us4j)
+zN5Pg}h7C#s>cnjO!HR<lW1dvUt@DXos;=hz{{4pd=0j1Ez?NgZd25I(ea8=_;Cww@
+zV!fgC6pt3Awr5#Qp{=~ezEywcsCziQB0J;f=}IRXF=|CQg}Iqr{rLhZ`L*UfN2D#`
+zc-$7kKbS?N`IFf^5<2Bgc76FV`IG1JVn0vrol4LtC@6UJ;LsHv=F1g2CXI|C+{X!-
+zL_fep$T~HU-d&Qi?IcH})uPeo@T;$(=yn=s<9Bk%<dDK$sHw`kK~mlg9t2I{34S=*
+zi^an|4aSZ>ZW$h6%aM|Y=OcWY`biixYJ5AJy;A%JPiOYn2wX+wT;8>oxSz7jlBe(g
+zXIMA{(yM=OB7=SKbaO^-B|=kMNlAVlx6?0i>f{B|%bzCAPWwV^r{?{alnj>(l$VQ0
+zxoOGPGnSlxk_tq9rt+cBF}`0oJ`N(PvM;fJ(-uw?sQ<gmdO~pM{|3K*!G`$1{gZ=+
+zV+`#KL5g?(7nwJ)JN9*jTtB^o4SUke|C@5{4Urw4hfHMrz;1YoZ?kXN3JyGmE2X{r
+z=@%fW28g6`?8P;dDW0;EV;$%~2RhIJo)-KsDE>YCCR2}c00000NkvXXu0mjfj{7B^
+
+literal 0
+HcmV?d00001
+
+diff --git a/src/fl_studio_mcp/desktop/templates/render_start.png b/src/fl_studio_mcp/desktop/templates/render_start.png
+new file mode 100644
+index 0000000000000000000000000000000000000000..25a28a2bc012a3d8fd25f1504ecc41914517e4fe
+GIT binary patch
+literal 1315
+zcmV+;1>E|HP)<h;3K|Lk000e1NJLTq003M7001lq1^@s6=*{1m000E)Nkl<Zc%1E<
+zeQZ-z6u^J4eeGu1<_6nfGIc78+tjI$45JWSAeb1Y4uc<vMi+;X#27U(k-z*Reh^5^
+zj7UWJNK9ZP{(~VTATj|5ix9Rr86SdRC1V?(bt~)M-ZgJyU0Yt;N4Ivh+><mX_nmk9
+z&i&ofbI-f4PpNulkw8kq#Fn^ANs++EKvc7X9*+mN+f83zU*bJVF>yE?6c!eenVA_L
+zxB<JcU?M^Y6h-kLmu(Rf4})iEX=!-iMr0c&cXxODJ4r2K;^1<*f-*(eMbqeDe1>O=
+zpmwO1cEa)rl!(A1wWFOc?dDt}mW9D55B^M~Jyt#zB77(p$u=YA5fymg3`s3U#K979
+zUDqXSMlaZ6j&P&Oj99HmJAphb0}nStg2)Slw2O#*qDFY=LJ+tbOS_25CsZs&c(~P9
+z8R6=!+#vleM|ddwYbGO#UG~3LO!ra@F`dykY8?4Yd;BS8Pc0%RT}2f=oNoArRa@O?
+z|MR^ZOTa^+$5oR?arI)J%-hGh<!d<M(Q)M5%AFHD=-9|CtLCMLyV$(8fwNjH*ReBk
+zRt*aae&*|q$M7cj{vxI-Ww^5#eY+!<l42KKjr%#_(FQ7=-t(tuJAMgGfSQ@hc$Yem
+zGq3mi2irE%#^;gcw8h7N3wFy9o{-!7zRS2f1vBT&;l7hwXgTM*>bjFVs@`OA<zzC{
+zyLo3>C1-YiMcocBW%CyB*n>snx>S6ft^8EKiCuqrvFFX?wI$Q|r?G>(W|ouQ{5?Bz
+z7qFlthcs&Wpv*(thR^x7wI?Ctiz$bj9Us-UxJ2`&O-y-pAvH_yp>5ALe%$sOe|vj5
+zxn%{*yJ~r3`f*l&xr25M6lXqkHc`LwJ5K%UqHO*Wo~x?h_f-v?7hp@DMA@YMtXsBm
+zAO-2#5!&a!%PSe1`E0`xyzw4SgtoPZ$R;y2+V=hnhp1oq5nudp7{}D-d3$Lsm4#`8
+zX(V(Iz7CrA9>U$1Nx^NmFwWbJlATAEdi7~b|7HI8<sfIS==5v4X{04|e92g)2t)UK
+z_;XJ^bqDq_>*d#(_rjwbUa=kDz+<anf7F{xn7i<4rsww3apo+SNXM=y{)ZrXpN9+G
+zTCo3t<GSIi6cL=hbnj^zx3^MRb2~XIwEL?WLpv#W<Ov>P7j>WPrBkz!b^nVLPYzkQ
+zg!zINZLcRDdPG%9T(l#fin%i=op=*AAqH~rz0;@QXm90guTK9JA4*0pIcaw6b{jU;
+zjy*ktaSj`5b}=(%m5^okqc*vYz}KVUoRE*pZo^?$#teFL)Zw}Yc@;eSRyA3wj;8g{
+zakP;QYk#GyU&nTIH%%87QS<(XxVP1@diPci6jih2<JtJSj?r}RC>JYCa=rgLK02Cq
+za`=Jyy!UA(&1;skzO5(Wunken{_57!(!zx7EPOuS;2;9;2m=N)(3W;0@o_qxoV$3L
+z^73+v`{5>aWssJ3;*!HdkIQyk>hLf#6<7^OJJI-90&Z4^8($QhMnZSRLhZ7@xSj|f
+zI@b@+WHN$vs9p9?&N`gb*HM8dgOegfv?btU?W9N%Z5ennI4e>_TLzvC&WaS#mVl47
+zlOjd5CE%ea%eIJ#hm3HNJi=vUi&6chtKnXCGsM_hlrnM|;u#jW@m`^PPm@uRq4zY0
+Z<Ud>og1=2CI1~T?002ovPDHLkV1lY@gm3@=
+
+literal 0
+HcmV?d00001
+
+diff --git a/src/fl_studio_mcp/desktop/templates/save_button.png b/src/fl_studio_mcp/desktop/templates/save_button.png
+new file mode 100644
+index 0000000000000000000000000000000000000000..eb3d08777e75c90d5198dbea71c0789cb2022a91
+GIT binary patch
+literal 1300
+zcmV+v1?&2WP)<h;3K|Lk000e1NJLTq003nG001Tk1^@s6-LO>+000ErNkl<Zc%1E;
+zdrZ}37{@=qbAbapo+${%I4EM))MY{eR-0H;yi5&jBUaR^)oQKf#+oy0Ym3$&=A5h6
+z8eQD-AE(8pGg`LUnsC4^Ef2&+3NJu`B9}vOgmZb@LBMn4*5RD<+j!rNJ?Hs-e-C@!
+z@AE$I^Im?+&Y}|0*w~0UWeGwE6h#3cKv5=if9a1;r%QV=WBxiiZ=eHkI2@x71_uWx
+zB~nTeb{>pI<7g~2j5W_g&)@j(@fW2|#QE?Eig%N`h#DUgK?&OY3<Ke*acM7R#owfv
+z;v@Z1%wPJaptL7s{(OQmDX~%#X&$D|6e)=$4?%+>10hr~5CaQ+h{aptA~b%2E{VO0
+zPXH!y!pYB+HAQY5m8kLI6O>>PlTt*52f6wZ>KcHaHhLf#bPAj1AA}c&*yJp>6>cUg
+zeGvwo4q<QOm-5f3Y<H-@zwqJ{K?x{6KHB&bB_g<D$e`fW-6Yo@;iE5G8F1@Zl(vGz
+z0k<mr3m-n~nxaGu*CwuFWqdc5+P@fZ350uu-s?@Y^f^`GU$}9fOqpy|aOWOo3Ve?3
+zowjyviaa*wuch^*m0qVe4)N)mC@Oq}`%+BAxNTgqRB-hBX5u&O;mzziJ~?!Tf1CnE
+zV<7#>w|F7p6bHYqM`UbZ*UpWsH5(BF*SS!6oKqLNaHypJQ)WtF=1hanvAwWaId<$k
+z&YYKcXa8#y=A;p?xjUk?y4y5We$M;*_VVth7If=(lW*2=(^^BPDU-EHV`D8QmFzVd
+zE}v`Rc0w-CJfBD0#UqsM+s}cD4l;HX@o2Js&ixP7UZtxq7rnn9=TO;UD*n)uSzOB7
+zuRM-9)-$qP4E$L|O^c1#q@|=Ky6AVrb5BAn?!E>r9Y)q=CZiKzSencIt~#o&I!IWT
+zi@En4r)#b;=yK50SjB~&MAqE90BzL!JHyqN8l=<KO4W&v`L#BW7hm5=$;L(w{@6p(
+zW5qm|zZ|;%rt_8^qo)_1DZ<%LQ}tDLY|CWHPkoqjS75*R1?|IHmL)F4l)jzP54KE<
+zOpQ*^Y1K^(<!JXeXiXWHGx_*oIyratZf>{La;E+XUQS;`%z_jOwx-fh{voHYkKopu
+z*|B#u8KeHY8EC1dwV;59mUob_te^9hT{zKVxBW|B(+?ajuc6l+N&jbVH~s1>#G`{y
+z>~%>wY}v4y<T#Ie8e*5MVf{)yo%LM|Yjo(fdW<FmiYAV<>`ml&YRH(q7`lR`S<AYu
+zn=s#~=F%+}LX6N|cZq&;9{E|R#3`VSTTI3St4J{f5)<|Q`v*h~y4xjKoc%PV1t#=v
+zCl32fE?d6gh@~5cdx(=~ALQAR_c$PIv|X&?x2~0>O;l4m*J>MJ&%<<l)ky!?)@Hc<
+zXO4aw$5Y$ipsZMrbEt>5`m=o39R2?K>x$>QFRRr`;zAR{!^3w{@9vwU5%)G!W}!=a
+zF)RLJVq&<}XY-!Eyi;iG!fVnL6Vs%iv={$_zwzc36z>;&Qz}qOJe>Tfbf3b!l|DgH
+zgF{jZ-=IiBMAUg0ulbW^io6n5qQHk=P`u}~;QHOW42cs~epGp%BIY^nlPPk_QldJA
+z&ni<wJw=uFVpe?3=)13I9?pq*W<TRhky1pI2f0rX>Kb^Sp!^3N&f_7ZY-$_;0000<
+KMNUMnLSTab=7Hq^
+
+literal 0
+HcmV?d00001
+
+diff --git a/src/fl_studio_mcp/flex.py b/src/fl_studio_mcp/flex.py
+new file mode 100644
+index 0000000..2f7dcde
+--- /dev/null
++++ b/src/fl_studio_mcp/flex.py
+@@ -0,0 +1,85 @@
++"""FLEX preset helpers over the controller's ``api_call`` op (needs only a bridge).
++
++FLEX exposes the presets of its *selected pack* through FL's plugin API:
++getPresetCount / getName(FPN_Preset, i) list them, nextPreset / prevPreset step
++through them, and FLEX renames its channel to the loaded preset -- so the
++channel name is how we read the current preset back. Switching packs has no
++API; see desktop.actions.flex_select_pack.
++"""
++
++from __future__ import annotations
++
++import time
++
++FPN_PRESET = 6          # midi.FPN_Preset
++NAME_SETTLE = 0.5       # FLEX's channel rename lands a moment after a preset step
++
++
++class FLApiError(RuntimeError):
++    pass
++
++
++def api(bridge, module: str, fn: str, *args):
++    r = bridge.call("api_call", {"module": module, "fn": fn, "args": list(args)})
++    if not isinstance(r, dict) or "error" in r:
++        raise FLApiError("%s.%s%r failed: %s" % (module, fn, args, (r or {}).get("error")))
++    return r.get("result")
++
++
++def api_batch(bridge, module: str, calls: list, chunk: int = 8) -> list:
++    """Several calls on one module; chunked to stay under the SysEx size limit."""
++    out = []
++    for i in range(0, len(calls), chunk):
++        r = bridge.call("api_call", {"module": module, "batch": calls[i:i + chunk]})
++        out += [x.get("result", {"error": x.get("error")}) for x in r.get("results", [])]
++    return out
++
++
++def plugin_name(bridge, channel: int) -> str | None:
++    try:
++        if not api(bridge, "plugins", "isValid", channel, -1):
++            return None
++        return api(bridge, "plugins", "getPluginName", channel, -1)
++    except FLApiError:
++        return None
++
++
++def require_flex(bridge, channel: int):
++    name = plugin_name(bridge, channel)
++    if name != "FLEX":
++        raise FLApiError("channel %d hosts %r, not FLEX" % (channel, name))
++
++
++def preset_names(bridge, channel: int) -> list[str]:
++    n = api(bridge, "plugins", "getPresetCount", channel, -1) or 0
++    return api_batch(bridge, "plugins", [["getName", [channel, -1, FPN_PRESET, i]] for i in range(n)])
++
++
++def current_preset(bridge, channel: int, settle: float = NAME_SETTLE) -> str:
++    time.sleep(settle)
++    return api(bridge, "channels", "getChannelName", channel)
++
++
++def load_preset(bridge, channel: int, preset: str, names: list[str] | None = None) -> dict:
++    """Step the selected pack until ``preset`` is loaded; verified by channel name."""
++    names = names or preset_names(bridge, channel)
++    match = next((n for n in names if n.lower() == preset.lower()), None)
++    if match is None:
++        close = [n for n in names if preset.lower() in n.lower()]
++        raise FLApiError("%r is not in the selected pack%s" %
++                         (preset, (" -- did you mean %s?" % close[:5]) if close else ""))
++    cur = current_preset(bridge, channel)
++    if cur not in names:   # nothing from this pack loaded yet: step once for an anchor
++        api(bridge, "plugins", "nextPreset", channel, -1)
++        cur = current_preset(bridge, channel)
++        if cur not in names:
++            raise FLApiError("could not read the current preset (channel shows %r)" % cur)
++    here, target = names.index(cur), names.index(match)
++    steps = (target - here) % len(names)
++    fn = "nextPreset"
++    if steps > len(names) // 2:
++        steps, fn = len(names) - steps, "prevPreset"
++    for _ in range(steps):
++        api(bridge, "plugins", fn, channel, -1)
++    now = current_preset(bridge, channel)
++    return {"ok": now == match, "channel": channel, "preset": now, "requested": match, "steps": steps}
+diff --git a/src/fl_studio_mcp/music/plugin_library.py b/src/fl_studio_mcp/music/plugin_library.py
+index 8502eee..dffdf3e 100644
+--- a/src/fl_studio_mcp/music/plugin_library.py
++++ b/src/fl_studio_mcp/music/plugin_library.py
+@@ -13,7 +13,9 @@ from __future__ import annotations
+ import os
+ from pathlib import Path
+ 
+-_ENV = "FLSTUDIO_MCP_PLUGIN_DB"     # override: full path to the 'Installed' folder
++from .._paths import image_line_roots
++
++_ENV ="FLSTUDIO_MCP_PLUGIN_DB"     # override: full path to the 'Installed' folder
+ 
+ # Rough keyword buckets for EFFECTS, a convenience for chain suggestions. Fuzzy
+ # (a name can land in several roles); the full effects list stays authoritative.
+@@ -40,8 +42,7 @@ def find_plugin_db():
+     env = os.environ.get(_ENV)
+     if env and os.path.isdir(env):
+         return env
+-    home = Path.home()
+-    for r in (home / "Documents" / "Image-Line", home / "Image-Line"):
++    for r in image_line_roots():
+         if not r.is_dir():
+             continue
+         for fl in sorted(r.glob("FL Studio*"), reverse=True):
+diff --git a/src/fl_studio_mcp/music/preset_library.py b/src/fl_studio_mcp/music/preset_library.py
+index 1a5275b..6a7bb75 100644
+--- a/src/fl_studio_mcp/music/preset_library.py
++++ b/src/fl_studio_mcp/music/preset_library.py
+@@ -14,7 +14,9 @@ import os
+ import re
+ from pathlib import Path
+ 
+-_ENV_FL = "FLSTUDIO_MCP_PRESETS"
++from .._paths import documents_dir, image_line_roots
++
++_ENV_FL ="FLSTUDIO_MCP_PRESETS"
+ _ENV_SERUM = "FLSTUDIO_MCP_SERUM_PRESETS"
+ 
+ # Small synonym map so a description like "vintage bass" matches Serum-style
+@@ -37,8 +39,7 @@ _SYN = {
+ 
+ 
+ def _fl_studio_dirs():
+-    home = Path.home()
+-    for r in (home / "Documents" / "Image-Line", home / "Image-Line"):
++    for r in image_line_roots():
+         if r.is_dir():
+             for fl in sorted(r.glob("FL Studio*"), reverse=True):
+                 yield fl
+@@ -59,7 +60,7 @@ def find_serum_presets():
+     env = os.environ.get(_ENV_SERUM)
+     if env and os.path.isdir(env):
+         return env
+-    xfer = Path.home() / "Documents" / "Xfer"
++    xfer = documents_dir() / "Xfer"
+     for name in ("Serum 2 Presets", "Serum2 Presets", "Serum Presets"):
+         p = xfer / name
+         if p.is_dir():
+diff --git a/src/fl_studio_mcp/music/reference.py b/src/fl_studio_mcp/music/reference.py
+new file mode 100644
+index 0000000..f7d21e9
+--- /dev/null
++++ b/src/fl_studio_mcp/music/reference.py
+@@ -0,0 +1,384 @@
++"""Reference-track pipeline: fetch (URL or file) -> optional stems -> analysis,
++plus A/B comparison of a rendered mix against a reference.
++
++Heavy/optional dependencies, imported lazily:
++  librosa, soundfile, scipy, numpy  -- the [audio] extra (required)
++  pyloudnorm                         -- LUFS (optional; falls back to RMS)
++  yt-dlp + ffmpeg (+ node)           -- URL download (optional)
++  demucs (+ torch, CUDA if present)  -- stem separation (optional)
++"""
++
++from __future__ import annotations
++
++import json
++import os
++import re
++import shutil
++import socket
++import subprocess
++import sys
++import time
++from collections import Counter
++from pathlib import Path
++
++NOTES = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"]
++_MAJ = [6.35, 2.23, 3.48, 2.33, 4.38, 4.09, 2.52, 5.19, 2.39, 3.66, 2.29, 2.88]   # Krumhansl
++_MIN = [6.33, 2.68, 3.52, 5.38, 2.60, 3.53, 2.54, 4.75, 3.98, 2.69, 3.34, 3.17]
++BANDS = {"sub <60": (20, 60), "bass 60-250": (60, 250), "low-mid 250-800": (250, 800),
++         "mid 800-2.5k": (800, 2500), "hi-mid 2.5-6k": (2500, 6000), "air 6k+": (6000, 20000)}
++SR = 22050
++
++
++def default_root() -> Path:
++    return Path(os.environ.get("FLSTUDIO_MCP_REFERENCE_DIR", Path.home() / "FL References"))
++
++
++def _slug(s: str) -> str:
++    return re.sub(r"[^\w\- ]+", "", s).strip()[:80] or "reference"
++
++
++# -- fetching --------------------------------------------------------------------
++
++def _ffmpeg() -> str | None:
++    found = shutil.which("ffmpeg")
++    if found:
++        return found
++    base = Path(os.environ.get("LOCALAPPDATA", "")) / "Microsoft" / "WinGet" / "Packages"
++    hits = sorted(base.glob("Gyan.FFmpeg*/**/bin/ffmpeg.exe")) if base.exists() else []
++    return str(hits[-1]) if hits else None
++
++
++def _ensure_pot_server() -> str:
++    """Start the bgutil PO-token server (YouTube 403 workaround) if it's installed
++    and not already listening on 127.0.0.1:4416."""
++    try:
++        with socket.create_connection(("127.0.0.1", 4416), timeout=0.5):
++            return "running"
++    except OSError:
++        pass
++    home = Path(os.environ.get("FLSTUDIO_MCP_BGUTIL_HOME",
++                               Path.home() / "Projects" / "bgutil-ytdlp-pot-provider"))
++    main_js = home / "server" / "build" / "main.js"
++    node = shutil.which("node")
++    if not (main_js.exists() and node):
++        return "not installed"
++    flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) | getattr(subprocess, "DETACHED_PROCESS", 0)
++    subprocess.Popen([node, str(main_js)], creationflags=flags,
++                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
++    for _ in range(20):
++        time.sleep(0.25)
++        try:
++            with socket.create_connection(("127.0.0.1", 4416), timeout=0.5):
++                return "started"
++        except OSError:
++            continue
++    return "failed to start"
++
++
++def fetch(source: str, root: Path | None = None) -> dict:
++    """Return {"wav": path, "title": str, "dir": path}. ``source`` is a file path
++    or an http(s) URL (downloaded as WAV with yt-dlp)."""
++    root = Path(root or default_root())
++    if not re.match(r"https?://", source):
++        p = Path(source)
++        if not p.exists():
++            raise FileNotFoundError(source)
++        d = root / _slug(p.stem)
++        d.mkdir(parents=True, exist_ok=True)
++        return {"wav": str(p), "title": p.stem, "dir": str(d)}
++
++    try:
++        import yt_dlp  # noqa: F401
++    except ImportError:
++        raise RuntimeError("yt-dlp is not installed: pip install yt-dlp") from None
++    ff = _ffmpeg()
++    if not ff:
++        raise RuntimeError("ffmpeg not found (winget install Gyan.FFmpeg)")
++    pot = _ensure_pot_server()
++    meta = subprocess.run([sys.executable, "-m", "yt_dlp", "--no-playlist", "--skip-download",
++                           "--js-runtimes", "node", "--print", "%(title)s", source],
++                          capture_output=True, text=True, timeout=120)
++    title = (meta.stdout.strip().splitlines() or ["reference"])[-1]
++    d = root / _slug(title)
++    d.mkdir(parents=True, exist_ok=True)
++    wav = d / "reference.wav"
++    if not wav.exists():
++        r = subprocess.run([sys.executable, "-m", "yt_dlp", "--no-playlist", "--js-runtimes", "node",
++                            "--ffmpeg-location", str(Path(ff).parent), "-x", "--audio-format", "wav",
++                            "-o", str(d / "reference.%(ext)s"), source],
++                           capture_output=True, text=True, timeout=900)
++        if not wav.exists():
++            tail = (r.stderr or r.stdout).strip().splitlines()[-3:]
++            raise RuntimeError("download failed (PO-token server: %s): %s" % (pot, " | ".join(tail)))
++    (d / "source.txt").write_text("%s\n%s\n" % (title, source), encoding="utf-8")
++    return {"wav": str(wav), "title": title, "dir": str(d), "pot_server": pot}
++
++
++def separate(wav: str, out_dir: str) -> dict | None:
++    """Demucs htdemucs stems (drums/bass/other/vocals); None if demucs is missing."""
++    try:
++        import demucs  # noqa: F401
++        import torch
++    except ImportError:
++        return None
++    stem_dir = Path(out_dir) / "stems" / "htdemucs" / Path(wav).stem
++    if not (stem_dir / "other.wav").exists():
++        dev = "cuda" if torch.cuda.is_available() else "cpu"
++        subprocess.run([sys.executable, "-m", "demucs", "-n", "htdemucs", "-d", dev,
++                        "-o", str(Path(out_dir) / "stems"), wav],
++                       capture_output=True, text=True, timeout=1800, check=True)
++    return {s: str(stem_dir / f"{s}.wav") for s in ("drums", "bass", "other", "vocals")}
++
++
++# -- analysis --------------------------------------------------------------------
++
++def _tempo_candidates(y, sr):
++    import numpy as np
++    import librosa
++    oenv = librosa.onset.onset_strength(y=y, sr=sr)
++    tg = librosa.feature.tempogram(onset_envelope=oenv, sr=sr)
++    freqs = librosa.tempo_frequencies(tg.shape[0], sr=sr)
++    prof = tg.mean(axis=1)
++    ok = (freqs > 60) & (freqs < 200)
++    seen, out = [], []
++    for i in np.argsort(prof[ok])[::-1]:
++        bpm = float(freqs[ok][i])
++        if all(abs(bpm - s) > 3 for s in seen):
++            seen.append(bpm)
++            out.append({"bpm": round(bpm, 1), "strength": round(float(prof[ok][i]), 3)})
++        if len(out) == 4:
++            break
++    return out, oenv
++
++
++def _keys(chroma_mean):
++    import numpy as np
++    scores = []
++    for i in range(12):
++        scores.append((float(np.corrcoef(np.roll(_MAJ, i), chroma_mean)[0, 1]), f"{NOTES[i]} major"))
++        scores.append((float(np.corrcoef(np.roll(_MIN, i), chroma_mean)[0, 1]), f"{NOTES[i]} minor"))
++    scores.sort(reverse=True)
++    return [{"key": k, "r": round(r, 3)} for r, k in scores[:4]]
++
++
++def _chords_per_bar(y, sr, beats, bpb=4):
++    import numpy as np
++    import librosa
++    chroma = librosa.feature.chroma_cqt(y=y, sr=sr, hop_length=512)
++    T, names = [], []
++    for i in range(12):
++        for q, iv in (("", (0, 4, 7)), ("m", (0, 3, 7))):
++            v = np.zeros(12)
++            v[[(i + x) % 12 for x in iv]] = 1
++            T.append(v / np.linalg.norm(v))
++            names.append(NOTES[i] + q)
++    T = np.array(T)
++    bars = beats[::bpb]
++    out = []
++    for a, b in zip(bars[:-1], bars[1:], strict=False):
++        c = chroma[:, a:b].mean(axis=1)
++        out.append("N" if c.sum() < 1e-6 else names[int(np.argmax(T @ (c / (np.linalg.norm(c) + 1e-9))))])
++    return out
++
++
++def _bass_roots(y, sr, beats, bpb=4):
++    import numpy as np
++    import librosa
++    f0, voiced, _ = librosa.pyin(y, fmin=librosa.note_to_hz("C1"), fmax=librosa.note_to_hz("C4"),
++                                 sr=sr, frame_length=4096, hop_length=512)
++    bars = beats[::bpb]
++    out = []
++    for a, b in zip(bars[:-1], bars[1:], strict=False):
++        seg = f0[a:b][voiced[a:b]]
++        out.append("-" if len(seg) < 3 else
++                   NOTES[np.bincount(np.round(librosa.hz_to_midi(seg)).astype(int) % 12).argmax()])
++    return out
++
++
++def _bar_energy(y, sr, bar_times):
++    import numpy as np
++    import librosa
++    rms = librosa.feature.rms(y=y, hop_length=512)[0]
++    t = librosa.frames_to_time(np.arange(len(rms)), sr=sr, hop_length=512)
++    out = []
++    for a, b in zip(bar_times[:-1], bar_times[1:], strict=False):
++        m = (t >= a) & (t < b)
++        out.append(round(float(20 * np.log10(rms[m].mean() + 1e-9)), 1) if m.any() else -90.0)
++    return out
++
++
++def _sections(energy, min_bars=4):
++    """Label contiguous bar runs as low/mid/high energy (rough song map)."""
++    import numpy as np
++    e = np.convolve(np.array(energy), np.ones(3) / 3, mode="same")
++    hi, lo = e.max() - 3.0, np.median(e) - 4.0
++    labels = ["high" if v >= hi else "low" if v <= lo else "mid" for v in e]
++    runs = []
++    for i, lab in enumerate(labels):
++        if runs and runs[-1][0] == lab:
++            runs[-1][2] = i
++        else:
++            runs.append([lab, i, i])
++    merged = []
++    for r in runs:                      # absorb runs shorter than min_bars into the previous run
++        if merged and r[2] - r[1] + 1 < min_bars:
++            merged[-1][2] = r[2]
++        else:
++            merged.append(r)
++    return [{"energy": lab, "bars": f"{a + 1}-{b + 1}"} for lab, a, b in merged]
++
++
++def _common_loop(chords, size=4):
++    seqs = Counter(tuple(chords[i:i + size]) for i in range(0, max(0, len(chords) - size + 1)))
++    seqs = {k: v for k, v in seqs.items() if "N" not in k and len(set(k)) > 1}
++    if not seqs:
++        return None
++    loop, n = max(seqs.items(), key=lambda kv: kv[1])
++    return {"loop": " - ".join(loop), "occurrences": n}
++
++
++def _drum_grid(path, bar_times, b0, b1):
++    import numpy as np
++    import librosa
++    import scipy.signal as sg
++    y, sr = librosa.load(path, sr=SR, mono=True)
++    out = {}
++    for name, (lo, hi) in {"kick": (30, 120), "snare": (180, 2500), "hats": (6000, 10000)}.items():
++        x = sg.sosfilt(sg.butter(4, [lo, hi], btype="band", fs=sr, output="sos"), y)
++        env = librosa.onset.onset_strength(y=x, sr=sr, hop_length=256)
++        times = librosa.frames_to_time(librosa.onset.onset_detect(onset_envelope=env, sr=sr, hop_length=256,
++                                                                  delta=0.15), sr=sr, hop_length=256)
++        hist = np.zeros(16)
++        for b in range(b0, min(b1, len(bar_times) - 1)):
++            a, e = bar_times[b], bar_times[b + 1]
++            for t in times[(times >= a) & (times < e)]:
++                hist[int(round((t - a) / (e - a) * 16)) % 16] += 1
++        hist /= max(1, b1 - b0)
++        out[name] = [i + 1 for i, v in enumerate(hist) if v >= 0.5]   # 16th steps hit in >=50% of bars
++    return out
++
++
++def tonal_balance(y, sr):
++    import numpy as np
++    import librosa
++    S = np.abs(librosa.stft(y, n_fft=4096)) ** 2
++    f = librosa.fft_frequencies(sr=sr, n_fft=4096)
++    tot = S.sum()
++    return {k: round(float(10 * np.log10(S[(f >= a) & (f < b)].sum() / tot + 1e-12)), 1)
++            for k, (a, b) in BANDS.items()}
++
++
++def analyze(wav: str, stems: dict | None = None, bpm: float | None = None) -> dict:
++    import numpy as np
++    import librosa
++    y, sr = librosa.load(wav, sr=SR, mono=True)
++    cands, oenv = _tempo_candidates(y, sr)
++    tempo, beats = librosa.beat.beat_track(onset_envelope=oenv, sr=sr,
++                                           start_bpm=bpm or cands[0]["bpm"], tightness=400)
++    beat_times = librosa.frames_to_time(beats, sr=sr)
++    bar_times = [round(float(t), 3) for t in beat_times[::4]]
++    yh = librosa.load(stems["other"], sr=SR, mono=True)[0] if stems else librosa.effects.harmonic(y)
++    chroma_mean = librosa.feature.chroma_cqt(y=yh, sr=sr).mean(axis=1)
++    chords = _chords_per_bar(yh, sr, beats)
++    energy = _bar_energy(y, sr, bar_times)
++    loud = int(np.argmax(np.convolve(energy, np.ones(8), mode="valid")))   # loudest 8-bar window
++    res = {
++        "duration_sec": round(len(y) / sr, 1),
++        "tempo_candidates": cands,
++        "beat_grid_bpm": round(float(np.atleast_1d(tempo)[0]), 1),
++        "key_candidates": _keys(chroma_mean),
++        "pitch_class_profile": {NOTES[i]: round(float(v), 2) for i, v in enumerate(chroma_mean / chroma_mean.max())},
++        "chord_loop": _common_loop(chords),
++        "chords_per_bar": chords,
++        "sections": _sections(energy),
++        "loudest_8_bars": f"{loud + 1}-{loud + 8}",
++        "bar_energy_db": energy,
++        "bar_start_times": bar_times,
++        "tonal_balance_db_rel": tonal_balance(y, sr),
++        "stems": stems,
++    }
++    if stems:
++        yb = librosa.load(stems["bass"], sr=SR, mono=True)[0]
++        res["bass_roots_per_bar"] = _bass_roots(yb, sr, beats)
++        res["drum_grid_loudest_section"] = _drum_grid(stems["drums"], bar_times, loud, loud + 8)
++    return res
++
++
++def summarize(res: dict) -> dict:
++    """Compact view for an LLM: drop the long per-bar arrays, keep the musical facts."""
++    keep = {k: v for k, v in res.items()
++            if k not in ("chords_per_bar", "bar_energy_db", "bar_start_times", "bass_roots_per_bar", "stems")}
++    keep["chords_per_bar"] = " ".join(res.get("chords_per_bar", []))
++    if "bass_roots_per_bar" in res:
++        keep["bass_roots_per_bar"] = " ".join(res["bass_roots_per_bar"])
++    return keep
++
++
++def analyze_reference(source: str, stems: bool = True, out_dir: str | None = None, bpm: float | None = None) -> dict:
++    f = fetch(source, Path(out_dir) if out_dir else None)
++    st = separate(f["wav"], f["dir"]) if stems else None
++    res = analyze(f["wav"], st, bpm)
++    path = Path(f["dir"]) / "analysis.json"
++    path.write_text(json.dumps(res, indent=1), encoding="utf-8")
++    out = summarize(res)
++    out.update({"title": f["title"], "wav": f["wav"], "analysis_json": str(path),
++                "stems_dir": str(Path(st["other"]).parent) if st else None,
++                "stem_separation": "demucs htdemucs" if st else "skipped (demucs not installed or stems=False)"})
++    return out
++
++
++# -- A/B comparison --------------------------------------------------------------
++
++def _loudest_window(y, sr, seconds):
++    import numpy as np
++    hop = int(sr * 0.5)
++    mono = y.mean(axis=1)
++    e = np.array([np.mean(mono[i:i + hop] ** 2) for i in range(0, len(mono) - hop, hop)])
++    w = max(1, int(seconds / 0.5))
++    if len(e) <= w:
++        return 0.0, len(mono) / sr
++    i = int(np.argmax(np.convolve(e, np.ones(w), mode="valid")))
++    return i * 0.5, i * 0.5 + seconds
++
++
++def _metrics(y, sr):
++    import numpy as np
++    import librosa
++    mono = y.mean(axis=1)
++    try:
++        import pyloudnorm as pyln
++        lufs = round(float(pyln.Meter(sr).integrated_loudness(y)), 1)
++    except ImportError:
++        lufs = None
++    peak = 20 * np.log10(np.abs(y).max() + 1e-12)
++    rms = 20 * np.log10(np.sqrt((mono ** 2).mean()) + 1e-12)
++    mid, side = (y[:, 0] + y[:, -1]) / 2, (y[:, 0] - y[:, -1]) / 2
++    width = 20 * np.log10(np.sqrt((side ** 2).mean()) / (np.sqrt((mid ** 2).mean()) + 1e-12) + 1e-12)
++    m32 = mono.astype("float32")
++    S = np.abs(librosa.stft(m32, n_fft=4096))
++    return {"lufs": lufs, "peak_dbfs": round(float(peak), 1), "crest_db": round(float(peak - rms), 1),
++            "side_mid_db": round(float(width), 1),
++            "centroid_hz": int(librosa.feature.spectral_centroid(S=S, sr=sr).mean()),
++            "bands_db_rel": tonal_balance(m32, sr)}
++
++
++def compare(mix: str, reference: str, mix_range=None, ref_range=None, window_sec: float = 20.0) -> dict:
++    import soundfile as sf
++    out = {}
++    for key, path, rng in (("mix", mix, mix_range), ("reference", reference, ref_range)):
++        y, sr = sf.read(path, always_2d=True)
++        a, b = rng if rng else _loudest_window(y, sr, window_sec)
++        out[key] = dict(_metrics(y[int(a * sr):int(b * sr)], sr), section_sec=[round(a, 1), round(b, 1)])
++    m, r = out["mix"], out["reference"]
++    diff = {k: (round(m[k] - r[k], 1) if m[k] is not None and r[k] is not None else None)
++            for k in ("lufs", "peak_dbfs", "crest_db", "side_mid_db", "centroid_hz")}
++    diff["bands_db_rel"] = {k: round(m["bands_db_rel"][k] - r["bands_db_rel"][k], 1) for k in BANDS}
++    hints = []
++    if diff["lufs"] is not None and diff["lufs"] < -3:
++        hints.append("Mix is %.1f LU quieter: drive the master limiter/maximizer harder." % -diff["lufs"])
++    if diff["side_mid_db"] < -2:
++        hints.append("Mix is narrower: widen pads/chords (negative stereo separation = wider).")
++    for band, d in diff["bands_db_rel"].items():
++        if abs(d) >= 2:
++            hints.append("%s is %+.1f dB vs reference." % (band, d))
++    return {"mix": m, "reference": r, "diff_mix_minus_ref": diff, "hints": hints}
+diff --git a/src/fl_studio_mcp/pyscript_gen.py b/src/fl_studio_mcp/pyscript_gen.py
+index c1f7f83..c1333bc 100644
+--- a/src/fl_studio_mcp/pyscript_gen.py
++++ b/src/fl_studio_mcp/pyscript_gen.py
+@@ -16,9 +16,9 @@ from __future__ import annotations
+ 
+ import os
+ 
+-PIANO_ROLL_SCRIPTS_DIR = os.path.expanduser(
+-    "~/Documents/Image-Line/FL Studio/Settings/Piano roll scripts"
+-)
++from ._paths import fl_user_data_dir
++
++PIANO_ROLL_SCRIPTS_DIR = str(fl_user_data_dir() / "Settings" / "Piano roll scripts")
+ APPLY_SCRIPT_NAME = "MCP_Apply.pyscript"
+ 
+ _DEFAULT_VELOCITY = 100 / 127.0
+diff --git a/src/fl_studio_mcp/pyscript_trigger.py b/src/fl_studio_mcp/pyscript_trigger.py
+index bf6029a..506c69c 100644
+--- a/src/fl_studio_mcp/pyscript_trigger.py
++++ b/src/fl_studio_mcp/pyscript_trigger.py
+@@ -112,16 +112,37 @@ def _trigger_windows(settle=0.35):
+     hwnd = find_fl_hwnd()
+     focused = force_focus(hwnd) if hwnd else False
+     time.sleep(settle)
++    # Never fire the shortcut into another app: require that the foreground
++    # window belongs to FL's process (main window, plugin or dialog).
++    if not (hwnd and _same_process(_windows_api()[0].GetForegroundWindow(), hwnd)):
++        return {
++            "platform": "windows",
++            "fl_found": bool(hwnd),
++            "focused": False,
++            "sent_hotkey": False,
++            "shortcut": "Ctrl+Alt+Y",
++            "error": "FL Studio is not in the foreground; hotkey not sent",
++        }
+     pyautogui.hotkey("ctrl", "alt", "y")
+     return {
+         "platform": "windows",
+-        "fl_found": bool(hwnd),
++        "fl_found": True,
+         "focused": bool(focused),
+         "sent_hotkey": True,
+         "shortcut": "Ctrl+Alt+Y",
+     }
+ 
+ 
++def _same_process(a, b) -> bool:
++    import ctypes
++    from ctypes import wintypes
++    u, _k = _windows_api()
++    pa, pb = wintypes.DWORD(), wintypes.DWORD()
++    u.GetWindowThreadProcessId(a, ctypes.byref(pa))
++    u.GetWindowThreadProcessId(b, ctypes.byref(pb))
++    return bool(a) and pa.value == pb.value
++
++
+ def trigger_run_last_script(settle=0.35):
+     """Focus FL Studio and send the platform "Run last script again" shortcut."""
+     if sys.platform == "win32":
+diff --git a/src/fl_studio_mcp/server.py b/src/fl_studio_mcp/server.py
+index 7980a73..58a5d12 100644
+--- a/src/fl_studio_mcp/server.py
++++ b/src/fl_studio_mcp/server.py
+@@ -40,6 +40,7 @@ from .tools import plugin as plugin_tools
+ from .tools import presets as presets_tools
+ from .tools import resources as resource_defs
+ from .tools import routing as routing_tools
++from .tools import studio as studio_tools
+ from .tools import transport as transport_tools
+ 
+ 
+@@ -57,7 +58,8 @@ REQUIREMENTS
+      Windows: create both in loopMIDI. macOS: enable two buses in IAC Driver
+      (Audio MIDI Setup). Linux: use snd-virmidi.
+   3. The FLStudioMCP controller script must be installed under
+-     Documents/Image-Line/FL Studio/Settings/Hardware/FLStudioMCP/
++     <FL user data folder>/Settings/Hardware/FLStudioMCP/ (Options > File
++     settings shows the folder; often Documents/Image-Line/FL Studio)
+   4. In FL Studio: Options > MIDI Settings,
+        - Enable 'FLStudioMCP RX' in the Input list, set Controller type to
+          FLStudioMCP, give it a Port number (any value, e.g. 42).
+@@ -66,12 +68,26 @@ REQUIREMENTS
+          the MCP server.
+   5. Call fl_ping first to verify the bridge is healthy.
+ 
++TYPICAL SESSION
++  fl_ping -> fl_arm_note_bridge (once per FL session) -> build sounds
++  (fl_clone_channel a FLEX channel, fl_route_channel, fl_flex_select_pack,
++  fl_flex_load_preset) -> per part: fl_arrange_select_channel +
++  fl_write_piano_roll_notes -> mix (fl_diagnose_mix, fl_gain_stage,
++  fl_apply_mix_fix, fl_set_stereo_separation) -> fl_save_project ->
++  fl_render_wav -> fl_compare_to_reference against fl_reference_analyze.
++  fl_screenshot shows you FL when a GUI step is unclear; fl_api_call reaches
++  any FL scripting function the other tools don't cover.
++
+ LIMITS YOU SHOULD KNOW ABOUT (these are FL API limitations, not server bugs)
+   - Cannot load new VST/AU plugin instances. You can only control plugins
+-    that already exist in the project.
+-  - Cannot create new patterns from scratch. Work with existing patterns,
+-    or clone via the Piano Roll pyscript.
++    that already exist in the project -- but you CAN clone an existing
++    channel (fl_clone_channel) to get more instances of it (e.g. FLEX).
++  - Cannot place clips in the playlist. Write a whole song into one long
++    pattern (PAT mode renders it), or let the user arrange patterns.
++  - Cannot load audio files/samples; the user drags them in.
+   - Tempo writes are sometimes ignored if FL is in a modal dialog.
++  - GUI-driven tools (FLEX packs, clone, arm, save, render) assume FL's
++    default UI scale; they never type into other apps.
+ 
+ When the user asks for something outside these limits, explain the limit
+ clearly rather than retrying.
+@@ -100,6 +116,7 @@ def build_server() -> FastMCP:
+     export_tools.register(mcp)      # MIDI export: arrangement spec -> type-1 .mid on disk
+     presets_tools.register(mcp)     # Preset suggester: read preset names from disk
+     mix_doctor_tools.register(mcp)  # Mix Doctor: diagnose whole mix + gated apply-fixes
++    studio_tools.register(mcp)      # FLEX packs/presets, clone/route, arm bridge, save/render, reference A/B
+     # Later tool packs register here as they ship:
+     #   pattern_tools.register(mcp)
+     return mcp
+diff --git a/src/fl_studio_mcp/tools/pianoroll.py b/src/fl_studio_mcp/tools/pianoroll.py
+index 333c93f..922fa34 100644
+--- a/src/fl_studio_mcp/tools/pianoroll.py
++++ b/src/fl_studio_mcp/tools/pianoroll.py
+@@ -49,8 +49,9 @@ def register(mcp: FastMCP) -> None:
+ 
+         Each note: {pitch (MIDI), time_bars, length_bars, velocity 0-1}. Set
+         quantize (grid in bars) to snap note starts to a grid before writing.
+-        Setup: open the Piano roll and run 'MCP_Apply' once from its Scripting
+-        menu (so Run last script again targets it). mode='replace' clears first.
++        Target a channel first with fl_arrange_select_channel. Once per FL
++        session call fl_arm_note_bridge (runs MCP_Apply from the piano-roll
++        menu); if notes don't appear, arm again. mode='replace' clears first.
+         """
+         arr = [n.model_dump() for n in notes]
+         if quantize and quantize > 0:
+diff --git a/src/fl_studio_mcp/tools/studio.py b/src/fl_studio_mcp/tools/studio.py
+new file mode 100644
+index 0000000..447e49c
+--- /dev/null
++++ b/src/fl_studio_mcp/tools/studio.py
+@@ -0,0 +1,194 @@
++"""Studio tools: sound selection (FLEX), channel setup, note-bridge arming,
++save/render, screenshots, generic FL API access, and the reference-track
++pipeline.
++
++GUI-driven and heavy tools run in the daemon via ``bridge.desktop(...)`` so they
++work under sandboxed MCP clients. They only ever send input to FL Studio and
++refuse to act if FL can't be brought to the foreground.
++"""
++
++from __future__ import annotations
++
++import base64
++from typing import Annotated, Any, List, Optional
++
++from fastmcp import FastMCP
++from fastmcp.utilities.types import Image
++from pydantic import Field
++
++from .. import flex
++from ..connection import get_bridge
++
++_GUI = {"readOnlyHint": False, "destructiveHint": False, "idempotentHint": False, "openWorldHint": True}
++_READ = {"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": False}
++
++
++def register(mcp: FastMCP) -> None:
++    # -- generic API ---------------------------------------------------------------
++
++    @mcp.tool(annotations={"title": "Call any FL scripting API function", "readOnlyHint": False,
++                           "destructiveHint": True, "idempotentHint": False, "openWorldHint": True})
++    def fl_api_call(
++        module: Annotated[str, Field(description="FL scripting module: plugins, channels, mixer, patterns, playlist, transport, ui, general, device, arrangement, midi.")],
++        fn: Annotated[str, Field(description="Function name, e.g. 'getChannelName', 'setTrackStereoSep'.")] = "",
++        args: Annotated[Optional[List[Any]], Field(description="Positional arguments.")] = None,
++        batch: Annotated[Optional[List[List[Any]]], Field(description="Instead of fn/args: [[fn, [args]], ...] on the same module, one round trip.")] = None,
++    ) -> dict:
++        """Escape hatch to FL Studio's Python scripting API (the same API MIDI
++        controller scripts use; see FL's 'MIDI scripting' docs). Use it for
++        anything the dedicated tools don't cover -- e.g. channels.setTargetFxTrack,
++        mixer.setTrackStereoSep, plugins.getParamName, ui.showWindow. Results that
++        aren't JSON-safe come back as repr strings. Reads can lag FL's UI by
++        ~0.5 s right after a write."""
++        params = {"module": module, "batch": batch} if batch else {"module": module, "fn": fn, "args": args or []}
++        return get_bridge().call("api_call", params)
++
++    # -- FLEX -------------------------------------------------------------------------
++
++    @mcp.tool(annotations={**_READ, "title": "List FLEX preset packs"})
++    def fl_flex_list_packs() -> dict:
++        """Installed FLEX preset packs (user + factory), in FLEX's Library order."""
++        return get_bridge().desktop("flex_list_packs")
++
++    @mcp.tool(annotations={**_GUI, "title": "Select a FLEX pack"})
++    def fl_flex_select_pack(
++        channel: Annotated[int, Field(ge=0, description="Channel-rack index of a FLEX instance.")],
++        pack: Annotated[str, Field(description="Pack name from fl_flex_list_packs.")],
++        keep_open: Annotated[bool, Field(description="Leave the FLEX window open afterwards.")] = False,
++    ) -> dict:
++        """Switch a FLEX instance to another preset pack (opens its window and
++        clicks the pack in the Library -- FL's API can't do this) and return the
++        pack's preset names. Then load one with fl_flex_load_preset. Closes any
++        other open FLEX windows first."""
++        return get_bridge().desktop("flex_select_pack", {"channel": channel, "pack": pack, "keep_open": keep_open})
++
++    @mcp.tool(annotations={**_READ, "title": "List FLEX presets"})
++    def fl_flex_list_presets(channel: Annotated[int, Field(ge=0)]) -> dict:
++        """Presets in the FLEX instance's currently selected pack, plus the loaded
++        preset (FLEX names its channel after the loaded preset)."""
++        b = get_bridge()
++        flex.require_flex(b, channel)
++        names = flex.preset_names(b, channel)
++        return {"channel": channel, "current": flex.current_preset(b, channel, settle=0),
++                "count": len(names), "presets": names}
++
++    @mcp.tool(annotations={**_GUI, "openWorldHint": False, "title": "Load a FLEX preset"})
++    def fl_flex_load_preset(
++        channel: Annotated[int, Field(ge=0)],
++        preset: Annotated[str, Field(description="Exact preset name from the selected pack (case-insensitive).")],
++    ) -> dict:
++        """Load a preset from the FLEX instance's selected pack (steps with
++        next/prev preset, verified by name). Switch packs first with
++        fl_flex_select_pack if needed."""
++        b = get_bridge()
++        flex.require_flex(b, channel)
++        return flex.load_preset(b, channel, preset)
++
++    # -- channels / mixer -------------------------------------------------------------
++
++    @mcp.tool(annotations={**_GUI, "title": "Clone a channel"})
++    def fl_clone_channel(
++        channel: Annotated[int, Field(ge=0, description="Channel to clone (e.g. a FLEX instance to get more instruments).")],
++        count: Annotated[int, Field(ge=1, le=16)] = 1,
++    ) -> dict:
++        """Clone a channel-rack channel (FL's Alt+C) -- the way to add more
++        instances of an instrument that's already in the project, since the API
++        can't load plugins. Returns the new channel indices. Route each clone to
++        its own mixer track with fl_route_channel."""
++        return get_bridge().desktop("clone_channel", {"channel": channel, "count": count})
++
++    @mcp.tool(annotations={"title": "Route a channel to a mixer track", "readOnlyHint": False,
++                           "destructiveHint": False, "idempotentHint": True, "openWorldHint": False})
++    def fl_route_channel(
++        channel: Annotated[int, Field(ge=0)],
++        mixer_track: Annotated[int, Field(ge=0, description="Mixer insert (0 = Master).")],
++        track_name: Annotated[Optional[str], Field(description="Optional new name for the mixer track.")] = None,
++    ) -> dict:
++        """Send a channel-rack channel to a mixer insert, optionally naming it."""
++        b = get_bridge()
++        flex.api(b, "channels", "setTargetFxTrack", channel, mixer_track)
++        if track_name:
++            flex.api(b, "mixer", "setTrackName", mixer_track, track_name)
++        return {"ok": True, "channel": channel, "mixer_track": mixer_track, "track_name": track_name}
++
++    @mcp.tool(annotations={"title": "Set mixer stereo separation", "readOnlyHint": False,
++                           "destructiveHint": False, "idempotentHint": True, "openWorldHint": False})
++    def fl_set_stereo_separation(
++        track: Annotated[int, Field(ge=0)],
++        value: Annotated[float, Field(ge=-1.0, le=1.0, description="NEGATIVE = wider (measured), positive = narrower/merged, 0 = neutral.")],
++    ) -> dict:
++        """Widen or narrow a mixer track (pads/chords wider, bass/kick mono)."""
++        flex.api(get_bridge(), "mixer", "setTrackStereoSep", track, value)
++        return {"ok": True, "track": track, "stereo_sep": value}
++
++    # -- note bridge / project ---------------------------------------------------------
++
++    @mcp.tool(annotations={**_GUI, "title": "Arm the piano-roll note bridge"})
++    def fl_arm_note_bridge() -> dict:
++        """Run MCP_Apply once from the piano roll's Tools > Scripts menu so that
++        fl_write_piano_roll_notes can apply notes automatically. Needed once per
++        FL session (after every FL restart); call it if notes don't appear."""
++        return get_bridge().desktop("arm_note_bridge")
++
++    @mcp.tool(annotations={**_GUI, "title": "Save the FL project"})
++    def fl_save_project(
++        name: Annotated[Optional[str], Field(description="Project name, used only if the project has never been saved.")] = None,
++    ) -> dict:
++        """Save (Ctrl+S). For an untitled project, fills FL's Save-as dialog with
++        ``name`` (FL creates a project folder under its Projects directory)."""
++        return get_bridge().desktop("save_project", {"name": name}, timeout=60)
++
++    @mcp.tool(annotations={**_GUI, "title": "Render to WAV"})
++    def fl_render_wav(
++        path: Annotated[Optional[str], Field(description="Absolute .wav path. Default: '<project> render N.wav' next to the saved project.")] = None,
++    ) -> dict:
++        """Export WAV of what FL would play now (PAT mode = current pattern, SONG
++        mode = playlist) and wait until the file is complete. Use the WAV with
++        fl_compare_to_reference."""
++        return get_bridge().desktop("render_wav", {"path": path}, timeout=900)
++
++    @mcp.tool(annotations={**_READ, "openWorldHint": True, "title": "Screenshot FL Studio"})
++    def fl_screenshot(max_width: Annotated[int, Field(ge=400, le=2560)] = 1600) -> Image:
++        """Screenshot of the monitor FL Studio is on (other monitors are never
++        captured). Use it to check what FL is showing when a GUI step fails."""
++        r = get_bridge().desktop("screenshot", {"max_width": max_width}, timeout=30)
++        return Image(data=base64.b64decode(r["jpeg_b64"]), format="jpeg")
++
++    # -- reference pipeline -------------------------------------------------------------
++
++    @mcp.tool(annotations={**_GUI, "title": "Analyze a reference track"})
++    def fl_reference_analyze(
++        source: Annotated[str, Field(description="Audio file path, or a URL (YouTube etc.) to download with yt-dlp.")],
++        stems: Annotated[bool, Field(description="Separate stems with Demucs first (much better chords/bass/drums; GPU if available).")] = True,
++        bpm: Annotated[Optional[float], Field(description="Force the beat-grid tempo if the estimate is a half/double.")] = None,
++        out_dir: Annotated[Optional[str], Field(description="Where to keep audio + analysis (default ~/FL References/<title>).")] = None,
++    ) -> dict:
++        """Deep musical analysis of a reference: tempo candidates, key
++        candidates, chord per bar + most common 4-bar loop, bass roots, energy
++        sections (find drops/breakdowns), drum hit grid of the loudest section,
++        tonal balance. Use it as a STYLE reference -- write original parts in the
++        same key/tempo/energy rather than copying melodies. Downloads are for
++        private reference only; respect the source's terms."""
++        return get_bridge().desktop("reference_analyze",
++                                    {"source": source, "stems": stems, "bpm": bpm, "out_dir": out_dir},
++                                    timeout=1800)
++
++    @mcp.tool(annotations={**_READ, "title": "Compare a mix to a reference"})
++    def fl_compare_to_reference(
++        mix_path: Annotated[str, Field(description="Rendered mix WAV (from fl_render_wav).")],
++        reference_path: Annotated[str, Field(description="Reference WAV (e.g. 'wav' from fl_reference_analyze).")],
++        mix_start: Annotated[Optional[float], Field(description="Section start (s) in the mix; omit both to auto-pick the loudest window.")] = None,
++        mix_end: Optional[float] = None,
++        ref_start: Annotated[Optional[float], Field(description="Section start (s) in the reference.")] = None,
++        ref_end: Optional[float] = None,
++        window_sec: Annotated[float, Field(gt=2)] = 20.0,
++    ) -> dict:
++        """Measured A/B of two sections (e.g. both drops): LUFS, peak, crest
++        factor, stereo width, brightness and 6-band tonal balance, with
++        mix-minus-reference diffs and hints. Iterate: adjust -> fl_render_wav ->
++        compare again."""
++        mr = [mix_start, mix_end] if mix_start is not None and mix_end is not None else None
++        rr = [ref_start, ref_end] if ref_start is not None and ref_end is not None else None
++        return get_bridge().desktop("compare_mix", {"mix": mix_path, "reference": reference_path,
++                                                    "mix_range": mr, "ref_range": rr,
++                                                    "window_sec": window_sec}, timeout=600)
