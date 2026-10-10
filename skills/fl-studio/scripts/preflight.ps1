@@ -15,7 +15,14 @@ $py = (Get-ChildItem "$env:LOCALAPPDATA\Programs\Python\Python3*\python.exe" -Er
 if (-not $py) { Bad "Python not found under $env:LOCALAPPDATA\Programs\Python (see references/setup.md)"; exit 1 }
 $scripts = Join-Path (Split-Path $py) 'Scripts'
 $daemonExe = Join-Path $scripts 'fl-studio-mcp-daemon.exe'
-if (-not (Test-Path $daemonExe)) { Bad "fl-studio-mcp not installed (pip install -e <repo>[audio,studio])"; exit 1 }
+if (-not (Test-Path $daemonExe)) {
+    # Usually a half-finished pip run: pip couldn't replace fl-studio-mcp.exe while an MCP client
+    # (e.g. Claude Desktop) had it running, and left the package partly uninstalled.
+    Bad ("fl-studio-mcp is missing or half-installed ($daemonExe not found). Fix: close Claude Desktop, then run " +
+         "<FL-Studio-Claude-Integration repo>\scripts\install.ps1 -NoSkill -SkipPrereqs (it stops running fl-studio-mcp " +
+         "processes and reinstalls). Repo: https://github.com/CinnamonTwists/FL-Studio-Claude-Integration")
+    exit 1
+}
 Ok "Python: $py"
 
 # 1. loopMIDI running (it recreates its saved ports on start)

@@ -50,9 +50,25 @@ Write-Output "   python: $python"
 # -- 2. MCP server ------------------------------------------------------------------
 Step "Install the fl-studio MCP server (editable, from this repo)"
 $extras = 'audio,studio' + $(if ($Stems) { ',stems' } else { '' })
-$daemons = Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object { $_.CommandLine -match 'fl-studio-mcp-daemon' }
-if ($daemons) {
-    Act "stop the running bridge daemon (pip can't replace its exe while it runs)" { $daemons | ForEach-Object { Stop-Process -Id $_.ProcessId -Force } }
+# pip must replace fl-studio-mcp(.exe) and fl-studio-mcp-daemon(.exe). If either is running (the
+# daemon, or a server an MCP client such as Claude Desktop keeps open) Windows locks the file and
+# pip fails half-way, leaving the package uninstalled. Stop them first; clients relaunch servers.
+$running = Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
+           Where-Object { $_.CommandLine -match 'fl-studio-mcp(-daemon)?(\.exe)?' -and $_.ProcessId -ne $PID }
+if ($running) {
+    Act "stop $(@($running).Count) running fl-studio-mcp process(es) so pip can replace their executables" {
+        $running | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+        Start-Sleep 1
+    }
+    Write-Output "   (restart Claude Desktop afterwards so it relaunches the server; preflight restarts the daemon)"
+}
+# A failed pip run leaves '~'-prefixed stash folders that make pip print warnings forever.
+$site = & $python -c "import sysconfig; print(sysconfig.get_paths()['purelib'])" 2>$null
+if ($site -and (Test-Path $site)) {
+    Get-ChildItem $site -Directory -Filter '~l*studio*mcp*' -ErrorAction SilentlyContinue | ForEach-Object {
+        $stale = $_.FullName
+        Act "remove stale pip leftover $stale" { Remove-Item $stale -Recurse -Force }
+    }
 }
 if ($Stems) { Write-Output "   tip: for GPU stem separation install CUDA torch first: pip install torch torchaudio --index-url https://download.pytorch.org/whl/cu124" }
 Act "pip install -e `"$repo\flstudio-mcp[$extras]`"" { & $python -m pip install --no-warn-script-location -e "$repo\flstudio-mcp[$extras]"; if ($LASTEXITCODE) { throw "pip install failed" } }

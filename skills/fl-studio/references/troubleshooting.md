@@ -5,7 +5,7 @@
 | `fl_ping`: "No heartbeat received" | Controller not loaded or ports mismatched. Check FL MIDI Settings (setup.md step 5). View > Script output should show `[FLStudioMCP] Ready`. If FL was just restarted, look for the RX output auto-paired onto port 10. loopMIDI's window shows which port carries traffic: heartbeat on RX instead of TX = that pairing bug. |
 | `fl_ping`: "Heartbeat is Ns old" | FL restarted under a running daemon: restart the daemon (preflight). |
 | "Cannot reach the fl-studio-mcp daemon" | Daemon not running: run preflight (starts it minimized). |
-| Server process dies at start / "No module named fl_studio_mcp" | A pip install failed half-way (locked daemon exe). Stop daemon, `pip install --no-deps -e <repo>`. |
+| Preflight: "fl-studio-mcp is missing or half-installed" / server dies with "No module named fl_studio_mcp" | A pip run failed half-way because `fl-studio-mcp.exe` or the daemon was running (Claude Desktop keeps the server open). Close Claude Desktop, run `scripts\install.ps1 -NoSkill -SkipPrereqs` from the repo (stops those processes, removes pip's `~l_studio_mcp` leftovers, reinstalls), restart Desktop. |
 | Notes don't appear | Note bridge not armed this FL session -> `fl_arm_note_bridge`. Or FL wasn't foreground (result has `sent_hotkey: false`). |
 | Notes land in the wrong instrument | Always `fl_arrange_select_channel` right before each write; the patched controller closes the piano roll so it re-opens on that channel. |
 | `fl_flex_select_pack` "FLEX window not found" | Another window covers FLEX, FL UI scale isn't default, or the plugin isn't FLEX. Call `fl_screenshot` and look. |
