@@ -19,9 +19,3 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
-
----
-
-The flstudio-mcp/ directory contains a modified copy of
-https://github.com/rosasynthesiz/flstudio-mcp, Copyright (c) 2026 rosasynthesiz,
-used under the MIT License (see flstudio-mcp/LICENSE).

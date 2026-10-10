@@ -1,0 +1,13 @@
+FL Studio x Claude
+Copyright (c) 2026 CinnamonTwists. Licensed under the MIT License (see LICENSE).
+
+This repository includes third-party software:
+
+flstudio-mcp/
+  A modified copy of https://github.com/rosasynthesiz/flstudio-mcp
+  Copyright (c) 2026 rosasynthesiz
+  Licensed under the MIT License (see flstudio-mcp/LICENSE).
+  Modifications are described in flstudio-mcp/UPSTREAM.md and docs/upstream-changes.patch.
+
+FL Studio and FLEX are products of Image-Line. Claude is a product of Anthropic.
+This project is not affiliated with or endorsed by either company.
